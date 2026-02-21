@@ -1,0 +1,33 @@
+# vsce package で VSIX を作成する際に除外するファイル
+# 配布サイズを最小化するため、ソースや開発用ファイルを除外する
+
+# TypeScript ソースコード（コンパイル済みの out/ のみ配布）
+src/
+tsconfig.json
+
+# 開発用
+.vscode/
+.github/
+*.map
+
+# ドキュメント（README.md は配布に含める）
+CHANGELOG.md
+
+# Node.js 開発ツール
+node_modules/
+
+# Python ソースのキャッシュのみ除外（python/ 本体は extract_why/search_why で使用するため含める）
+python/__pycache__/
+python/**/__pycache__/
+python/**/*.pyc
+
+# ビルド作業フォルダ（VSIXには不要）
+build_tmp/
+
+# バイナリプレースホルダー（実際のバイナリのみ含める）
+bin/**/.gitkeep
+
+# ビルドスクリプト（配布不要）
+build_win.ps1
+build_mac.sh
+build_linux.sh

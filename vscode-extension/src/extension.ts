@@ -1,0 +1,1179 @@
+/**
+ * ai_audit VSCode 拡張機能 (Phase 1)
+ *
+ * 利用者の動線:
+ *   1. VSIXをVSCodeにインストール
+ *   2. コマンドパレット → "ai_audit: 接続設定を開く" → API URL / APIキー / モデル名を入力
+ *   3. 初回起動時に Python 未検出 / 設定未入力なら案内メッセージを表示
+ *   4. Pythonファイルを保存するだけで監査が走り、波線で結果が出る
+ *
+ * 設定は VSCode の設定画面で管理する（.env / config.json は利用者が意識しない）
+ * main.py 起動時に VSCode 設定を環境変数として渡すことで .env を不要にする
+ */
+
+import * as cp from "child_process";
+import * as fs from "fs";
+import * as http from "http";
+import * as path from "path";
+import * as vscode from "vscode";
+
+// ---------------------------------------------------------------------------
+// サポート言語定義（将来の拡張に備えて一元管理）
+// ---------------------------------------------------------------------------
+const SUPPORTED_LANGUAGES: Array<{
+  id: string;
+  label: string;
+  status: "supported" | "planned";
+  since: string;
+}> = [
+  { id: "python",     label: "Python",     status: "supported", since: "v0.1.0" },
+  { id: "javascript", label: "JavaScript", status: "planned",   since: "-" },
+  { id: "typescript", label: "TypeScript", status: "planned",   since: "-" },
+  { id: "go",         label: "Go",         status: "planned",   since: "-" },
+  { id: "csharp",     label: "C#",         status: "planned",   since: "-" },
+];
+
+// ---------------------------------------------------------------------------
+// グローバル状態
+// ---------------------------------------------------------------------------
+let diagnosticCollection: vscode.DiagnosticCollection;
+const runningAudits = new Set<string>();
+let statusBarItem: vscode.StatusBarItem;
+let extensionPath: string;
+
+// ---------------------------------------------------------------------------
+// 有効化エントリポイント
+// ---------------------------------------------------------------------------
+export function activate(context: vscode.ExtensionContext) {
+  extensionPath = context.extensionPath;
+
+  diagnosticCollection = vscode.languages.createDiagnosticCollection("ai_audit");
+  context.subscriptions.push(diagnosticCollection);
+
+  statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  statusBarItem.text = "$(shield) ai_audit";
+  statusBarItem.tooltip = "クリックして設定を開く";
+  statusBarItem.command = "aiAudit.openSettings";
+  statusBarItem.show();
+  context.subscriptions.push(statusBarItem);
+
+  // 起動時に必須設定チェック
+  checkSetupOnStartup(context);
+
+  // ファイル保存時に自動監査（サポート言語のみ）
+  context.subscriptions.push(
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      const cfg = vscode.workspace.getConfiguration("aiAudit");
+      if (!cfg.get<boolean>("enableOnSave", true)) { return; }
+      const supported = SUPPORTED_LANGUAGES.find(
+        (l) => l.id === doc.languageId && l.status === "supported"
+      );
+      if (supported) {
+        runAudit(doc.uri.fsPath, false);
+      }
+    })
+  );
+
+  // コマンド登録
+  // エクスプローラー右クリックから呼ばれると uri 引数が渡される
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.auditCurrentFile", (uri?: vscode.Uri) => {
+      const filePath = uri?.fsPath ?? vscode.window.activeTextEditor?.document.uri.fsPath;
+      if (!filePath) { return; }
+      const langId = uri
+        ? (filePath.endsWith(".py") ? "python" : "")
+        : (vscode.window.activeTextEditor?.document.languageId ?? "");
+      const supported = SUPPORTED_LANGUAGES.find(
+        (l) => l.id === langId && l.status === "supported"
+      );
+      if (!supported) {
+        vscode.window.showWarningMessage(
+          `ai_audit: このファイル形式はまだサポートされていません。` +
+          `サポート言語: コマンドパレットから "ai_audit: サポート言語一覧を表示" で確認できます。`
+        );
+        return;
+      }
+      runAudit(filePath, false);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.auditCurrentFileForce", (uri?: vscode.Uri) => {
+      const filePath = uri?.fsPath ?? vscode.window.activeTextEditor?.document.uri.fsPath;
+      if (!filePath) { return; }
+      runAudit(filePath, true);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.auditFolder", async (uri?: vscode.Uri) => {
+      // エクスプローラー右クリック → uri あり、コマンドパレット → フォルダ選択ダイアログ
+      let folderPath: string | undefined = uri?.fsPath;
+      if (!folderPath) {
+        const picked = await vscode.window.showOpenDialog({
+          canSelectFiles: false,
+          canSelectFolders: true,
+          canSelectMany: false,
+          openLabel: "このフォルダを一括監査する",
+        });
+        folderPath = picked?.[0]?.fsPath;
+      }
+      if (!folderPath) { return; }
+      runAuditFolder(folderPath);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.clearDiagnostics", () => {
+      diagnosticCollection.clear();
+      statusBarItem.text = "$(shield) ai_audit";
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.openSettings", () => {
+      vscode.commands.executeCommand(
+        "workbench.action.openSettings",
+        "aiAudit"
+      );
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.showSupportedLanguages", () => {
+      showSupportedLanguages();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.selectModel", () => {
+      selectModel();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.setupWhyFeature", async () => {
+      await setupWhyFeature();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.extractWhy", async (uri?: vscode.Uri) => {
+      const cfg = vscode.workspace.getConfiguration("aiAudit");
+      if (!cfg.get<boolean>("enableWhyFeature", false)) {
+        const action = await vscode.window.showInformationMessage(
+          "ai_audit: 設計思想機能はまだ有効になっていません。セットアップを実行しますか？",
+          "セットアップする",
+          "キャンセル"
+        );
+        if (action === "セットアップする") {
+          await setupWhyFeature();
+        }
+        return;
+      }
+      // エクスプローラー右クリック → uri あり、コマンドパレット → ワークスペースルート
+      const folderPath = uri?.fsPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!folderPath) {
+        vscode.window.showWarningMessage("ai_audit: ワークスペースを開いた状態で実行してください。");
+        return;
+      }
+      runBackendCommand("extract_why", [folderPath], "extractWhy");
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.searchWhy", async () => {
+      const cfg = vscode.workspace.getConfiguration("aiAudit");
+      if (!cfg.get<boolean>("enableWhyFeature", false)) {
+        const action = await vscode.window.showInformationMessage(
+          "ai_audit: 設計思想機能はまだ有効になっていません。セットアップを実行しますか？",
+          "セットアップする",
+          "キャンセル"
+        );
+        if (action === "セットアップする") {
+          await setupWhyFeature();
+        }
+        return;
+      }
+      const query = await vscode.window.showInputBox({
+        title: "ai_audit: 設計思想を検索",
+        prompt: "検索キーワードを入力してください（例: キャッシュ戦略、エラーハンドリング）",
+        placeHolder: "検索キーワード",
+      });
+      if (!query) { return; }
+      runBackendCommand("search_why", [query], "searchWhy");
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.reviewArchitecture", (uri?: vscode.Uri) => {
+      // エクスプローラー右クリック → uri あり、コマンドパレット → ワークスペースルート
+      const folderPath = uri?.fsPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!folderPath) {
+        vscode.window.showWarningMessage("ai_audit: ワークスペースを開いた状態で実行してください。");
+        return;
+      }
+      // 解析対象フォルダ内に _architecture.md を出力させる（--output フラグで指定）
+      const outputMd = path.join(folderPath, "_architecture.md");
+      runBackendCommand("review_architecture", [folderPath, "--output", outputMd], "reviewArchitecture");
+    })
+  );
+
+  // Code Action: 指摘をCopilot Chatへ追記
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "aiAudit.sendToCopilotChat",
+      async (diagnostic: vscode.Diagnostic) => {
+        const text = buildPromptFromDiagnostic(diagnostic);
+        // Copilot Chat が利用可能なら chat パネルへ書き込む
+        const copilotAvailable = vscode.extensions.getExtension("GitHub.copilot-chat") !== undefined;
+        if (copilotAvailable) {
+          await vscode.commands.executeCommand("workbench.panel.chat.view.copilot.focus");
+          await vscode.commands.executeCommand(
+            "workbench.action.chat.sendToNewChat",
+            { inputValue: text }
+          );
+        } else {
+          // Copilot 未インストールの場合はクリップボードへ
+          const current = await vscode.env.clipboard.readText();
+          const appended = current.endsWith("\n") || current === ""
+            ? current + text
+            : current + "\n" + text;
+          await vscode.env.clipboard.writeText(appended + "\n");
+          vscode.window.showInformationMessage(
+            "ai_audit: GitHub Copilot Chat が見つからないためクリップボードにコピーしました。"
+          );
+        }
+      }
+    )
+  );
+
+  // Code Action: 指摘をクリップボードへ追記
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "aiAudit.copyToClipboard",
+      async (diagnostic: vscode.Diagnostic) => {
+        const text = buildPromptFromDiagnostic(diagnostic);
+        const current = await vscode.env.clipboard.readText();
+        const appended = current.endsWith("\n") || current === ""
+          ? current + text
+          : current + "\n" + text;
+        await vscode.env.clipboard.writeText(appended + "\n");
+        vscode.window.showInformationMessage(
+          "ai_audit: クリップボードに追記しました。AIチャットに貼り付けてください。"
+        );
+      }
+    )
+  );
+
+  // Code Action プロバイダー登録（波線ホバー時にボタンを表示）
+  const supportedLanguageIds = SUPPORTED_LANGUAGES
+    .filter((l) => l.status === "supported")
+    .map((l) => ({ language: l.id }));
+  context.subscriptions.push(
+    vscode.languages.registerCodeActionsProvider(
+      supportedLanguageIds,
+      new AiAuditCodeActionProvider(),
+      { providedCodeActionKinds: AiAuditCodeActionProvider.providedKinds }
+    )
+  );
+}
+
+export function deactivate() {
+  diagnosticCollection.clear();
+}
+
+// ---------------------------------------------------------------------------
+// 起動時セットアップチェック
+// ---------------------------------------------------------------------------
+async function checkSetupOnStartup(_context: vscode.ExtensionContext): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration("aiAudit");
+  const apiUrl = cfg.get<string>("apiBaseUrl", "").trim();
+  const apiKey = cfg.get<string>("apiKey", "").trim();
+  const model  = cfg.get<string>("modelName", "").trim();
+
+  const missing: string[] = [];
+  if (!apiUrl)  { missing.push("API URL (aiAudit.apiBaseUrl)"); }
+  // apiKey は任意（Ollama等APIキー不要な環境では空でよい）
+  if (!model)   { missing.push("モデル名 (aiAudit.modelName)"); }
+
+  // 同梱バイナリの存在チェック
+  const binaryPath = resolveBackendBinary();
+  const binaryOk = binaryPath ? fs.existsSync(binaryPath) : false;
+
+  if (missing.length > 0 || !binaryOk) {
+    const messages: string[] = [];
+    if (!binaryOk) {
+      messages.push(
+        `お使いのOS（${process.platform}）に対応したバイナリが見つかりません。\n` +
+        `正しいOS用の VSIX をインストールしてください。`
+      );
+    }
+    if (missing.length > 0) {
+      messages.push(`以下の必須設定が未入力です:\n  ・${missing.join("\n  ・")}`);
+    }
+
+    const action = await vscode.window.showWarningMessage(
+      `ai_audit: セットアップが必要です。\n${messages.join("\n\n")}`,
+      "設定画面を開く",
+      "後で"
+    );
+    if (action === "設定画面を開く") {
+      vscode.commands.executeCommand("aiAudit.openSettings");
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// モデル切り替え UI
+// ---------------------------------------------------------------------------
+async function selectModel(): Promise<void> {
+  const cfg    = vscode.workspace.getConfiguration("aiAudit");
+  const apiUrl = cfg.get<string>("apiBaseUrl", "").trim();
+
+  if (!apiUrl) {
+    const action = await vscode.window.showErrorMessage(
+      "ai_audit: API URL が設定されていません。先に設定画面で API URL を入力してください。",
+      "設定画面を開く"
+    );
+    if (action === "設定画面を開く") {
+      vscode.commands.executeCommand("aiAudit.openSettings");
+    }
+    return;
+  }
+
+  // Ollama の /api/tags を呼ぶ
+  statusBarItem.text = "$(sync~spin) ai_audit: モデル一覧を取得中...";
+  let models: Array<{ name: string; size: string }>;
+  try {
+    models = await fetchOllamaModels(apiUrl);
+  } catch (e) {
+    statusBarItem.text = "$(shield) ai_audit";
+    vscode.window.showErrorMessage(
+      `ai_audit: モデル一覧の取得に失敗しました。\n` +
+      `接続先: ${apiUrl}\n` +
+      `エラー: ${e}\n\n` +
+      `設定画面の "API URL" が正しいか確認してください。`
+    );
+    return;
+  }
+  statusBarItem.text = "$(shield) ai_audit";
+
+  const currentModel = cfg.get<string>("modelName", "");
+  const items: vscode.QuickPickItem[] = models.map((m) => ({
+    label: m.name,
+    description: m.size,
+    detail: m.name === currentModel ? "← 現在使用中" : undefined,
+  }));
+
+  const selected = await vscode.window.showQuickPick(items, {
+    title: "ai_audit: 使用するモデルを選択",
+    placeHolder: "モデル名を選択してください",
+    matchOnDescription: true,
+  });
+
+  if (!selected) { return; }
+
+  await cfg.update("modelName", selected.label, vscode.ConfigurationTarget.Global);
+  vscode.window.showInformationMessage(
+    `ai_audit: モデルを "${selected.label}" に変更しました。`
+  );
+}
+
+function fetchOllamaModels(baseUrl: string): Promise<Array<{ name: string; size: string }>> {
+  return new Promise((resolve, reject) => {
+    // /v1 を除いて /api/tags を呼ぶ
+    let ollamaBase = baseUrl.replace(/\/v1\/?$/, "");
+    const url = new URL("/api/tags", ollamaBase);
+
+    const req = http.get(url.toString(), (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(data);
+          const models = (json.models ?? []).map((m: {
+            name: string;
+            size?: number;
+          }) => ({
+            name: m.name,
+            size: m.size ? `${(m.size / 1_073_741_824).toFixed(1)} GB` : "?",
+          }));
+          resolve(models);
+        } catch (e) {
+          reject(new Error(`レスポンスの解析に失敗: ${e}`));
+        }
+      });
+    });
+    req.on("error", (e) => reject(e));
+    req.setTimeout(10000, () => {
+      req.destroy();
+      reject(new Error("タイムアウト（10秒）"));
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// サポート言語一覧表示
+// ---------------------------------------------------------------------------
+function showSupportedLanguages(): void {
+  const rows = SUPPORTED_LANGUAGES.map((l) => {
+    const status = l.status === "supported" ? "✅ サポート中" : "🔜 対応予定";
+    return `<tr><td>${l.label}</td><td>${status}</td><td>${l.since}</td></tr>`;
+  }).join("");
+
+  const panel = vscode.window.createWebviewPanel(
+    "aiAuditLanguages",
+    "ai_audit: サポート言語",
+    vscode.ViewColumn.Beside,
+    {
+      enableScripts: false,
+      retainContextWhenHidden: false,
+    }
+  );
+
+  panel.webview.html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+  <meta charset="UTF-8">
+</head>
+<body style="font-family:sans-serif;padding:20px">
+  <h2>ai_audit サポート言語一覧</h2>
+  <table border="1" cellpadding="8" cellspacing="0">
+    <thead>
+      <tr><th>言語</th><th>状態</th><th>対応バージョン</th></tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  </table>
+  <p style="color:gray;margin-top:16px">※ 対応予定言語へのリクエストはIssueでお知らせください。</p>
+</body>
+</html>`;
+}
+
+// ---------------------------------------------------------------------------
+// OS別バイナリパス解決
+// ---------------------------------------------------------------------------
+function resolveBackendBinary(): string | null {
+  const platform = process.platform; // "win32" | "darwin" | "linux"
+  let subDir: string;
+  let binName: string;
+
+  if (platform === "win32") {
+    subDir = "win";
+    binName = "main.exe";
+  } else if (platform === "darwin") {
+    subDir = "mac";
+    binName = "main";
+  } else {
+    subDir = "linux";
+    binName = "main";
+  }
+
+  return path.join(extensionPath, "bin", subDir, binName);
+}
+
+// ---------------------------------------------------------------------------
+// 監査実行
+// ---------------------------------------------------------------------------
+function runAudit(filePath: string, force: boolean): void {
+  if (runningAudits.has(filePath)) { return; }
+  runningAudits.add(filePath);
+
+  const cfg          = vscode.workspace.getConfiguration("aiAudit");
+  const apiUrl       = cfg.get<string>("apiBaseUrl", "").trim();
+  const apiKey       = cfg.get<string>("apiKey", "").trim();
+  const modelName    = cfg.get<string>("modelName", "").trim();
+  const maxTokens    = cfg.get<number | null>("maxOutputTokens", null);
+
+  // 必須設定チェック（apiKey は任意）
+  const missing: string[] = [];
+  if (!apiUrl)    { missing.push("API URL"); }
+  if (!modelName) { missing.push("モデル名"); }
+  if (missing.length > 0) {
+    vscode.window.showErrorMessage(
+      `ai_audit: 設定が不足しています。コマンドパレットから "ai_audit: 接続設定を開く" を実行して設定してください。\n未入力: ${missing.join(", ")}`
+    );
+    runningAudits.delete(filePath);
+    return;
+  }
+
+  // 拡張機能に同梱されたバイナリのパスを解決
+  const binaryPath = resolveBackendBinary();
+
+  if (!binaryPath || !fs.existsSync(binaryPath)) {
+    vscode.window.showErrorMessage(
+      `ai_audit: バイナリが見つかりません（${binaryPath}）。\n` +
+      `お使いのOSに対応した VSIX を再インストールしてください。`
+    );
+    runningAudits.delete(filePath);
+    return;
+  }
+
+  const args = ["audit", filePath];
+  if (force) { args.push("--force"); }
+
+  // VSCode 設定を環境変数として渡す（.env が不要になる）
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PYTHONUTF8: "1",          // Windows CP932 環境での文字化け防止
+    LLM_API_BASE_URL: apiUrl,
+    LLM_MODEL_NAME:   modelName,
+  };
+  // apiKey は任意（空の場合は環境変数を設定しない）
+  if (apiKey) { env["LLM_API_KEY"] = apiKey; }
+  if (maxTokens !== null && maxTokens !== undefined) {
+    env["LLM_MAX_OUTPUT_TOKENS"] = String(maxTokens);
+  }
+
+  const shortName = path.basename(filePath);
+  statusBarItem.text = `$(sync~spin) ai_audit: ${shortName} を監査中...`;
+
+  const proc = cp.spawn(binaryPath, args, {
+    cwd: path.dirname(binaryPath),
+    env,
+  });
+
+  const stderrChunks: Buffer[] = [];
+  proc.stderr.on("data", (data: Buffer) => { stderrChunks.push(data); });
+
+  proc.on("close", (code) => {
+    runningAudits.delete(filePath);
+    statusBarItem.text = "$(shield) ai_audit";
+
+    if (code !== 0) {
+      const stderr = decodeBuffer(stderrChunks);
+      vscode.window.showErrorMessage(
+        `ai_audit エラー: ${stderr.slice(0, 300)}`
+      );
+      return;
+    }
+
+    const auditJsonPath = filePath.replace(/\.py$/, "_audit.json");
+    if (!fs.existsSync(auditJsonPath)) {
+      diagnosticCollection.set(vscode.Uri.file(filePath), []);
+      return;
+    }
+
+    try {
+      const raw = fs.readFileSync(auditJsonPath, "utf-8");
+      const auditResult = JSON.parse(raw);
+      applyDiagnostics(filePath, auditResult);
+
+      const total = auditResult.total_issues ?? 0;
+      statusBarItem.text = total > 0
+        ? `$(warning) ai_audit: ${total} 件の指摘`
+        : "$(pass) ai_audit: 問題なし";
+    } catch (e) {
+      vscode.window.showErrorMessage(`ai_audit: 結果の読み込みに失敗しました: ${e}`);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// フォルダ一括監査
+// ---------------------------------------------------------------------------
+function runAuditFolder(folderPath: string): void {
+  const cfg       = vscode.workspace.getConfiguration("aiAudit");
+  const apiUrl    = cfg.get<string>("apiBaseUrl", "").trim();
+  const apiKey    = cfg.get<string>("apiKey", "").trim();
+  const modelName = cfg.get<string>("modelName", "").trim();
+  const maxTokens = cfg.get<number | null>("maxOutputTokens", null);
+
+  const missing: string[] = [];
+  if (!apiUrl)    { missing.push("API URL"); }
+  if (!modelName) { missing.push("モデル名"); }
+  if (missing.length > 0) {
+    vscode.window.showErrorMessage(
+      `ai_audit: 設定が不足しています。\n未入力: ${missing.join(", ")}`
+    );
+    return;
+  }
+
+  const binaryPath = resolveBackendBinary();
+  if (!binaryPath || !fs.existsSync(binaryPath)) {
+    vscode.window.showErrorMessage(
+      `ai_audit: バイナリが見つかりません（${binaryPath}）。\n` +
+      `お使いのOSに対応した VSIX を再インストールしてください。`
+    );
+    return;
+  }
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PYTHONUTF8: "1",          // Windows CP932 環境での文字化け防止
+    LLM_API_BASE_URL: apiUrl,
+    LLM_MODEL_NAME:   modelName,
+  };
+  if (apiKey)    { env["LLM_API_KEY"]           = apiKey; }
+  if (maxTokens !== null && maxTokens !== undefined) {
+    env["LLM_MAX_OUTPUT_TOKENS"] = String(maxTokens);
+  }
+
+  const shortName = path.basename(folderPath);
+  statusBarItem.text = `$(sync~spin) ai_audit: ${shortName}/ を一括監査中...`;
+
+  const proc = cp.spawn(binaryPath, ["audit", folderPath], {
+    cwd: path.dirname(binaryPath),
+    env,
+  });
+
+  const stderrChunks: Buffer[] = [];
+  proc.stderr.on("data", (data: Buffer) => { stderrChunks.push(data); });
+
+  proc.on("close", (code) => {
+    statusBarItem.text = "$(shield) ai_audit";
+    if (code !== 0) {
+      const stderr = decodeBuffer(stderrChunks);
+      vscode.window.showErrorMessage(`ai_audit エラー: ${stderr.slice(0, 300)}`);
+      return;
+    }
+
+    // フォルダ以下の _audit.json をすべて探して Diagnostics に反映する
+    let totalIssues = 0;
+    let fileCount = 0;
+    const applyAll = (dir: string) => {
+      let entries: string[];
+      try { entries = fs.readdirSync(dir); } catch { return; }
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry);
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.isDirectory()) {
+            applyAll(fullPath);
+          } else if (entry.endsWith("_audit.json")) {
+            const pyFile = fullPath.replace(/_audit\.json$/, ".py");
+            try {
+              const raw = fs.readFileSync(fullPath, "utf-8");
+              const auditResult = JSON.parse(raw);
+              applyDiagnostics(pyFile, auditResult);
+              totalIssues += auditResult.total_issues ?? 0;
+              fileCount++;
+            } catch { /* 読み込み失敗はスキップ */ }
+          }
+        } catch { /* stat 失敗はスキップ */ }
+      }
+    };
+    applyAll(folderPath);
+
+    statusBarItem.text = totalIssues > 0
+      ? `$(warning) ai_audit: ${totalIssues} 件の指摘`
+      : "$(pass) ai_audit: 問題なし";
+
+    vscode.window.showInformationMessage(
+      `ai_audit: ${shortName}/ の一括監査が完了しました。${fileCount} ファイル / ${totalIssues} 件の指摘`
+    );
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics 変換
+// ---------------------------------------------------------------------------
+function severityToDiagnosticSeverity(severity: string): vscode.DiagnosticSeverity {
+  switch (severity?.toLowerCase()) {
+    case "high":   return vscode.DiagnosticSeverity.Error;
+    case "medium": return vscode.DiagnosticSeverity.Warning;
+    default:       return vscode.DiagnosticSeverity.Information;
+  }
+}
+
+function applyDiagnostics(filePath: string, auditResult: {
+  chunks: Array<{
+    chunk_id: string;
+    issues: Array<{
+      type: string;
+      severity: string;
+      line_number_offset: number | null;
+      description: string;
+      suggestion: string;
+    }>;
+  }>;
+}): void {
+  const cfg = vscode.workspace.getConfiguration("aiAudit");
+  const showInfo = cfg.get<boolean>("showInformationDiagnostics", false);
+
+  const diagnostics: vscode.Diagnostic[] = [];
+  let fileLines: string[] = [];
+  try {
+    fileLines = fs.readFileSync(filePath, "utf-8").split("\n");
+  } catch { /* フォールバック */ }
+
+  for (const chunk of auditResult.chunks ?? []) {
+    const funcName = chunk.chunk_id.split(":").pop() ?? "";
+    let chunkStartLine = 0;
+    const defPattern = new RegExp(`^\\s*(def|class)\\s+${escapeRegex(funcName)}\\s*[:(]`);
+    for (let i = 0; i < fileLines.length; i++) {
+      if (defPattern.test(fileLines[i])) {
+        chunkStartLine = i;
+        break;
+      }
+    }
+
+    for (const issue of chunk.issues ?? []) {
+      const diagSeverity = severityToDiagnosticSeverity(issue.severity);
+      if (!showInfo && diagSeverity === vscode.DiagnosticSeverity.Information) { continue; }
+
+      const targetLine = chunkStartLine + (issue.line_number_offset ?? 0);
+      const lineText   = fileLines[targetLine] ?? "";
+      const range      = new vscode.Range(targetLine, 0, targetLine, lineText.length || 1);
+
+      const diag = new vscode.Diagnostic(
+        range,
+        `[ai_audit/${issue.type}] ${issue.description}`,
+        diagSeverity
+      );
+      diag.source = "ai_audit";
+
+      if (issue.suggestion) {
+        diag.relatedInformation = [
+          new vscode.DiagnosticRelatedInformation(
+            new vscode.Location(vscode.Uri.file(filePath), range),
+            `修正提案: ${issue.suggestion}`
+          ),
+        ];
+      }
+      diagnostics.push(diag);
+    }
+  }
+
+  diagnosticCollection.set(vscode.Uri.file(filePath), diagnostics);
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Buffer 配列を結合し、UTF-8 → CP932（Shift-JIS）の順にデコードを試みる。
+ * Windows の Python バイナリは CP932 で stderr を出力することがある。
+ */
+function decodeBuffer(chunks: Buffer[]): string {
+  const buf = Buffer.concat(chunks);
+  // まず UTF-8 として解釈（文字化け判定: replacement character が含まれないか）
+  const utf8 = buf.toString("utf-8");
+  if (!utf8.includes("\uFFFD")) {
+    return utf8;
+  }
+  // UTF-8 で文字化けしている場合は CP932（Shift-JIS）でデコード
+  try {
+    return new TextDecoder("shift_jis").decode(buf);
+  } catch {
+    return utf8; // TextDecoder が失敗したら UTF-8 フォールバック
+  }
+}
+
+// ---------------------------------------------------------------------------
+// バックエンドコマンド汎用実行（extract-why / search-why / review-architecture）
+// ---------------------------------------------------------------------------
+type BackendCommandId = "extractWhy" | "searchWhy" | "reviewArchitecture";
+
+const BACKEND_COMMAND_LABELS: Record<BackendCommandId, string> = {
+  extractWhy:          "設計思想を抽出中",
+  searchWhy:           "設計思想を検索中",
+  reviewArchitecture:  "アーキテクチャを解析中",
+};
+
+const BACKEND_COMMAND_TITLES: Record<BackendCommandId, string> = {
+  extractWhy:          "ai_audit: 設計思想抽出",
+  searchWhy:           "ai_audit: 設計思想検索",
+  reviewArchitecture:  "ai_audit: アーキテクチャ解析",
+};
+
+function runBackendCommand(
+  subCommand: string,
+  args: string[],
+  commandId: BackendCommandId
+): void {
+  const cfg       = vscode.workspace.getConfiguration("aiAudit");
+  const apiUrl    = cfg.get<string>("apiBaseUrl", "").trim();
+  const apiKey    = cfg.get<string>("apiKey", "").trim();
+  const modelName = cfg.get<string>("modelName", "").trim();
+  const maxTokens = cfg.get<number | null>("maxOutputTokens", null);
+
+  const missing: string[] = [];
+  if (!apiUrl)    { missing.push("API URL"); }
+  if (!modelName) { missing.push("モデル名"); }
+  if (missing.length > 0) {
+    vscode.window.showErrorMessage(
+      `ai_audit: 設定が不足しています。\n未入力: ${missing.join(", ")}`
+    );
+    return;
+  }
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PYTHONUTF8: "1",          // Windows CP932 環境での文字化け防止
+    LLM_API_BASE_URL: apiUrl,
+    LLM_MODEL_NAME:   modelName,
+  };
+  if (apiKey)    { env["LLM_API_KEY"]           = apiKey; }
+  if (maxTokens) { env["LLM_MAX_OUTPUT_TOKENS"] = String(maxTokens); }
+
+  const label = BACKEND_COMMAND_LABELS[commandId];
+  statusBarItem.text = `$(sync~spin) ai_audit: ${label}...`;
+
+  // extractWhy / searchWhy は chromadb が必要なため、
+  // バイナリ（PyInstaller）ではなく利用者環境の Python + 同梱 main.py で実行する
+  let spawnCmd: string;
+  let spawnArgs: string[];
+  let spawnCwd: string;
+
+  // extractWhy/searchWhy のみ Python 直接実行（chromadb が必要なため）
+  // reviewArchitecture はバイナリで実行
+  const needsPython = commandId === "extractWhy" || commandId === "searchWhy";
+  if (needsPython) {
+    const pythonPath = cfg.get<string>("pythonPath", "python").trim();
+    const mainPyPath = path.join(extensionPath, "python", "main.py");
+    spawnCmd  = pythonPath;
+    spawnArgs = [mainPyPath, subCommand, ...args];
+    spawnCwd  = path.join(extensionPath, "python");
+  } else {
+    const binaryPath = resolveBackendBinary();
+    if (!binaryPath || !fs.existsSync(binaryPath)) {
+      vscode.window.showErrorMessage(
+        `ai_audit: バイナリが見つかりません（${binaryPath}）。\n` +
+        `お使いのOSに対応した VSIX を再インストールしてください。`
+      );
+      return;
+    }
+    spawnCmd  = binaryPath;
+    spawnArgs = [subCommand, ...args];
+    spawnCwd  = path.dirname(binaryPath);
+  }
+
+  const proc = cp.spawn(spawnCmd, spawnArgs, {
+    cwd: spawnCwd,
+    env,
+    shell: needsPython, // Python はシェル経由で起動（PATH解決のため）
+  });
+
+  const stdoutChunks: Buffer[] = [];
+  const stderrChunks: Buffer[] = [];
+  proc.stdout?.on("data", (data: Buffer) => { stdoutChunks.push(data); });
+  proc.stderr.on("data",  (data: Buffer) => { stderrChunks.push(data); });
+
+  proc.on("error", (err) => {
+    statusBarItem.text = "$(shield) ai_audit";
+    if (needsPython) {
+      const pythonPath = cfg.get<string>("pythonPath", "python").trim();
+      vscode.window.showErrorMessage(
+        `ai_audit: Python の起動に失敗しました。\n` +
+        `パス: "${pythonPath}"\n` +
+        `エラー: ${err.message}\n\n` +
+        `設定画面の "Python パス" を確認してください。`
+      );
+    } else {
+      vscode.window.showErrorMessage(`ai_audit: 起動エラー: ${err.message}`);
+    }
+  });
+
+  proc.on("close", (code) => {
+    statusBarItem.text = "$(shield) ai_audit";
+    const stdout = decodeBuffer(stdoutChunks);
+    const stderr = decodeBuffer(stderrChunks);
+
+    if (code !== 0) {
+      vscode.window.showErrorMessage(`ai_audit エラー: ${stderr.slice(0, 300)}`);
+      return;
+    }
+
+    // 出力ファイルを読み込んで Webview に表示
+    const title = BACKEND_COMMAND_TITLES[commandId];
+    if (commandId === "extractWhy") {
+      const jsonPath = args[0].replace(/\.py$/, "_why.json");
+      showJsonResultInWebview(title, jsonPath);
+    } else if (commandId === "searchWhy") {
+      // search-why は stdout に結果を出力する
+      showTextResultInWebview(title, stdout || stderr);
+    } else if (commandId === "reviewArchitecture") {
+      // review-architecture は --output で指定したパスにファイルを書く
+      // args = [folderPath, "--output", outputMdPath]
+      const mdPath = args[2] ?? path.join(args[0], "_architecture.md");
+      showMarkdownResultInWebview(title, mdPath);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Webview 表示ヘルパー
+// ---------------------------------------------------------------------------
+
+function showJsonResultInWebview(title: string, jsonPath: string): void {
+  if (!fs.existsSync(jsonPath)) {
+    vscode.window.showWarningMessage(`ai_audit: 結果ファイルが見つかりません（${jsonPath}）`);
+    return;
+  }
+
+  let data: Array<{ chunk_id: string; why: string }> = [];
+  try {
+    data = JSON.parse(fs.readFileSync(jsonPath, "utf-8"));
+  } catch {
+    vscode.window.showErrorMessage(`ai_audit: 結果ファイルの読み込みに失敗しました（${jsonPath}）`);
+    return;
+  }
+
+  const rows = data.map((item) => `
+    <div class="card">
+      <div class="chunk-id">${escapeHtml(item.chunk_id)}</div>
+      <div class="why">${escapeHtml(item.why ?? "").replace(/\n/g, "<br>")}</div>
+    </div>
+  `).join("");
+
+  showWebview(title, `
+    <style>
+      body { font-family: var(--vscode-font-family); padding: 16px; }
+      .card { border: 1px solid var(--vscode-panel-border); border-radius: 4px;
+              padding: 12px; margin-bottom: 12px; }
+      .chunk-id { font-weight: bold; color: var(--vscode-textLink-foreground);
+                  margin-bottom: 6px; font-size: 0.9em; }
+      .why { line-height: 1.6; }
+    </style>
+    <h2>${escapeHtml(title)}</h2>
+    ${rows || "<p>結果がありません。</p>"}
+  `);
+}
+
+function showTextResultInWebview(title: string, text: string): void {
+  showWebview(title, `
+    <style>
+      body { font-family: var(--vscode-font-family); padding: 16px; }
+      pre { background: var(--vscode-textBlockQuote-background);
+            padding: 12px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; }
+    </style>
+    <h2>${escapeHtml(title)}</h2>
+    <pre>${escapeHtml(text)}</pre>
+  `);
+}
+
+function showMarkdownResultInWebview(title: string, mdPath: string): void {
+  if (!fs.existsSync(mdPath)) {
+    vscode.window.showWarningMessage(`ai_audit: 結果ファイルが見つかりません（${mdPath}）`);
+    return;
+  }
+
+  const md = fs.readFileSync(mdPath, "utf-8");
+  // Markdown をシンプルな HTML に変換（見出し・コードブロック・箇条書きのみ）
+  const html = md
+    .replace(/^### (.+)$/gm, "<h3>$1</h3>")
+    .replace(/^## (.+)$/gm,  "<h2>$1</h2>")
+    .replace(/^# (.+)$/gm,   "<h1>$1</h1>")
+    .replace(/```[\s\S]*?```/g, (m) => `<pre><code>${escapeHtml(m.slice(3, -3).replace(/^\w*\n/, ""))}</code></pre>`)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/^\* (.+)$/gm,  "<li>$1</li>")
+    .replace(/^- (.+)$/gm,   "<li>$1</li>")
+    .replace(/\n\n/g, "</p><p>")
+    .replace(/^(?!<[hlipc])(.+)$/gm, "<p>$1</p>");
+
+  showWebview(title, `
+    <style>
+      body { font-family: var(--vscode-font-family); padding: 16px; line-height: 1.6; }
+      h1,h2,h3 { color: var(--vscode-textLink-foreground); border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 4px; }
+      code { background: var(--vscode-textBlockQuote-background); padding: 2px 4px; border-radius: 3px; }
+      pre  { background: var(--vscode-textBlockQuote-background); padding: 12px; border-radius: 4px; overflow-x: auto; }
+      li   { margin-bottom: 4px; }
+    </style>
+    <h2>${escapeHtml(title)}</h2>
+    ${html}
+  `);
+}
+
+function showWebview(title: string, bodyHtml: string): void {
+  const panel = vscode.window.createWebviewPanel(
+    "aiAuditResult",
+    title,
+    vscode.ViewColumn.Beside,
+    { enableScripts: false, retainContextWhenHidden: false }
+  );
+  panel.webview.html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+  <meta charset="UTF-8">
+</head>
+<body>
+${bodyHtml}
+</body>
+</html>`;
+}
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// ---------------------------------------------------------------------------
+// AI連携用プロンプト生成
+// ---------------------------------------------------------------------------
+function buildPromptFromDiagnostic(diagnostic: vscode.Diagnostic): string {
+  const editor = vscode.window.activeTextEditor;
+  const fileName = editor ? path.basename(editor.document.uri.fsPath) : "不明なファイル";
+
+  // 指摘のメッセージから [ai_audit/type] プレフィックスを除いた本文を取得
+  const message = typeof diagnostic.message === "string"
+    ? diagnostic.message.replace(/^\[ai_audit\/[^\]]+\]\s*/, "")
+    : String(diagnostic.message);
+
+  // relatedInformation から修正提案を取得
+  const suggestion = diagnostic.relatedInformation?.[0]?.message
+    ?.replace(/^修正提案:\s*/, "") ?? "";
+
+  const line = diagnostic.range.start.line + 1; // 1始まりに変換
+
+  let prompt = `以下のコードの問題を修正してください。\n`;
+  prompt += `ファイル: ${fileName} (${line}行目付近)\n`;
+  prompt += `問題: ${message}\n`;
+  if (suggestion) {
+    prompt += `修正提案: ${suggestion}\n`;
+  }
+  return prompt;
+}
+
+// ---------------------------------------------------------------------------
+// 設計思想機能 セットアップウィザード
+// ---------------------------------------------------------------------------
+async function setupWhyFeature(): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration("aiAudit");
+  const currentPythonPath = cfg.get<string>("pythonPath", "python");
+
+  // Step 1: Python パスを確認・入力
+  const pythonPath = await vscode.window.showInputBox({
+    title: "ai_audit: 設計思想機能のセットアップ",
+    prompt: "使用する Python のパスを確認してください。通常は変更不要です。",
+    value: currentPythonPath,
+    placeHolder: "python",
+    validateInput: (value) => {
+      if (!value.trim()) { return "Python のパスを入力してください。"; }
+      return null;
+    },
+  });
+  if (!pythonPath) { return; } // キャンセル
+
+  const pyCmd = pythonPath.trim();
+
+  // Python が動作するかチェック
+  statusBarItem.text = "$(sync~spin) ai_audit: Python を確認中...";
+  const pythonOk = await runPythonCheck(pyCmd, ["--version"]);
+  statusBarItem.text = "$(shield) ai_audit";
+
+  if (!pythonOk) {
+    const action = await vscode.window.showErrorMessage(
+      `ai_audit: Python が見つかりませんでした。\nパス: "${pyCmd}"\n\n` +
+      `Python がインストールされているか確認し、正しいパスを入力してください。`,
+      "設定を変更する",
+      "キャンセル"
+    );
+    if (action === "設定を変更する") {
+      vscode.commands.executeCommand("aiAudit.openSettings");
+    }
+    return;
+  }
+
+  // pythonPath 設定を保存
+  await cfg.update("pythonPath", pyCmd, vscode.ConfigurationTarget.Global);
+
+  // chromadb がすでにインストール済みか確認
+  statusBarItem.text = "$(sync~spin) ai_audit: chromadb を確認中...";
+  const chromaOk = await runPythonCheck(pyCmd, ["-c", "import chromadb"]);
+  statusBarItem.text = "$(shield) ai_audit";
+
+  if (chromaOk) {
+    // すでにインストール済み → 即有効化
+    await cfg.update("enableWhyFeature", true, vscode.ConfigurationTarget.Global);
+    vscode.window.showInformationMessage(
+      "ai_audit: chromadb は既にインストール済みです。設計思想機能を有効にしました。"
+    );
+    return;
+  }
+
+  // chromadb 未インストール → インストール確認
+  const action = await vscode.window.showInformationMessage(
+    `chromadb がインストールされていません。\n` +
+    `インストールしますか？\n` +
+    `（実行コマンド: ${pyCmd} -m pip install chromadb）`,
+    "インストールする",
+    "キャンセル"
+  );
+  if (action !== "インストールする") { return; }
+
+  // VSCode ターミナルでインストール実行
+  const terminal = vscode.window.createTerminal("ai_audit: セットアップ");
+  terminal.show(true);
+  terminal.sendText(`${pyCmd} -m pip install chromadb`, true);
+
+  // インストール完了後に「有効にする」ボタンで確定
+  const done = await vscode.window.showInformationMessage(
+    `インストールが完了したら「有効にする」を押してください。`,
+    "有効にする",
+    "キャンセル"
+  );
+  if (done === "有効にする") {
+    await cfg.update("enableWhyFeature", true, vscode.ConfigurationTarget.Global);
+    vscode.window.showInformationMessage(
+      "ai_audit: 設計思想機能を有効にしました。"
+    );
+  }
+}
+
+/** Python コマンドを shell 経由で実行し、終了コード 0 なら true を返す */
+function runPythonCheck(pythonPath: string, args: string[]): Promise<boolean> {
+  return new Promise((resolve) => {
+    const proc = cp.spawn(pythonPath, args, { shell: true });
+    proc.on("close", (code) => resolve(code === 0));
+    proc.on("error", () => resolve(false));
+    setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } resolve(false); }, 8000);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Code Action プロバイダー（波線ホバー時のボタン）
+// ---------------------------------------------------------------------------
+class AiAuditCodeActionProvider implements vscode.CodeActionProvider {
+  static readonly providedKinds = [vscode.CodeActionKind.QuickFix];
+
+  provideCodeActions(
+    _document: vscode.TextDocument,
+    _range: vscode.Range,
+    context: vscode.CodeActionContext
+  ): vscode.CodeAction[] {
+    // ai_audit の診断のみ対象
+    const aiDiagnostics = context.diagnostics.filter(
+      (d) => d.source === "ai_audit"
+    );
+    if (aiDiagnostics.length === 0) { return []; }
+
+    const actions: vscode.CodeAction[] = [];
+
+    for (const diag of aiDiagnostics) {
+      // Copilot Chat へ送るボタン
+      const copilotAction = new vscode.CodeAction(
+        "$(copilot) Copilot Chat に修正依頼",
+        vscode.CodeActionKind.QuickFix
+      );
+      copilotAction.command = {
+        command: "aiAudit.sendToCopilotChat",
+        title: "Copilot Chat に修正依頼",
+        arguments: [diag],
+      };
+      copilotAction.diagnostics = [diag];
+      actions.push(copilotAction);
+
+      // クリップボードへコピーするボタン
+      const clipboardAction = new vscode.CodeAction(
+        "$(clippy) クリップボードにコピー（AI修正依頼用）",
+        vscode.CodeActionKind.QuickFix
+      );
+      clipboardAction.command = {
+        command: "aiAudit.copyToClipboard",
+        title: "クリップボードにコピー",
+        arguments: [diag],
+      };
+      clipboardAction.diagnostics = [diag];
+      actions.push(clipboardAction);
+    }
+
+    return actions;
+  }
+}

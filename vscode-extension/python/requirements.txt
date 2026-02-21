@@ -1,0 +1,14 @@
+# ai_audit 依存パッケージ
+# Python 3.9 以上が必要（ast.unparse を使用）
+#
+# インストール: pip install -r requirements.txt
+# バージョン固定日: 2026-02-21
+
+# ベクトルDB（ユースケースB: 設計思想の蓄積・検索）
+chromadb==1.5.1
+
+# LLM API への HTTP リクエスト
+requests==2.32.3
+
+# .env ファイルの読み込み
+python-dotenv==1.0.1

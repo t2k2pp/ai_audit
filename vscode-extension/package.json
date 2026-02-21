@@ -1,0 +1,158 @@
+{
+  "name": "ai-audit",
+  "publisher": "ai-audit-internal",
+  "displayName": "ai_audit - AI Code Auditor",
+  "description": "ファイル保存時に自動でAI多重マイクロ監査を実行し、問題箇所を波線とホバーで表示する",
+  "version": "0.2.0",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Linters"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "ai_audit",
+      "properties": {
+        "aiAudit.apiBaseUrl": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "**[必須]** LLM API の URL（例: `http://192.168.1.40:11434/v1`）\n\nOllama を使う場合: `http://<サーバーIP>:11434/v1`"
+        },
+        "aiAudit.apiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "API キー（任意）\n\nOllama など API キー不要な環境では空のままでOK\n\nOpenAI 等の有料API を使う場合は入力してください"
+        },
+        "aiAudit.modelName": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "**[必須]** 使用するモデル名（例: `gpt-oss:120b`）\n\n`ai_audit: モデル一覧を表示・切り替え` コマンドで一覧から選択できます"
+        },
+        "aiAudit.maxOutputTokens": {
+          "type": ["number", "null"],
+          "default": null,
+          "markdownDescription": "最大出力トークン数（`null` = モデルのデフォルト最大値を使用）\n\n大きいほど詳細な指摘が得られますが、推論時間が増えます"
+        },
+        "aiAudit.enableOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "ファイル保存時に自動で監査を実行する（OFF にすると手動のみ）"
+        },
+        "aiAudit.showInformationDiagnostics": {
+          "type": "boolean",
+          "default": false,
+          "description": "low 重要度の指摘も波線表示する（デフォルトは medium/high のみ）"
+        },
+        "aiAudit.enableWhyFeature": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "設計思想機能（抽出・検索）を有効にする\n\nPython と chromadb のインストールが必要です。\n初回は `ai_audit: 設計思想機能をセットアップ` コマンドで自動セットアップできます。"
+        },
+        "aiAudit.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "markdownDescription": "設計思想機能で使用する Python のパス\n\n通常は `python` のままでOKです。"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "aiAudit.auditCurrentFile",
+        "title": "ai_audit: 現在のファイルを監査する"
+      },
+      {
+        "command": "aiAudit.auditCurrentFileForce",
+        "title": "ai_audit: 現在のファイルを再監査する（キャッシュ無視）"
+      },
+      {
+        "command": "aiAudit.auditFolder",
+        "title": "ai_audit: フォルダを一括監査する"
+      },
+      {
+        "command": "aiAudit.clearDiagnostics",
+        "title": "ai_audit: 波線表示をクリアする"
+      },
+      {
+        "command": "aiAudit.selectModel",
+        "title": "ai_audit: モデル一覧を表示・切り替え"
+      },
+      {
+        "command": "aiAudit.showSupportedLanguages",
+        "title": "ai_audit: サポート言語一覧を表示"
+      },
+      {
+        "command": "aiAudit.openSettings",
+        "title": "ai_audit: 接続設定を開く"
+      },
+      {
+        "command": "aiAudit.setupWhyFeature",
+        "title": "ai_audit: 設計思想機能をセットアップ"
+      },
+      {
+        "command": "aiAudit.extractWhy",
+        "title": "ai_audit: このファイルの設計思想を抽出"
+      },
+      {
+        "command": "aiAudit.searchWhy",
+        "title": "ai_audit: 設計思想を検索"
+      },
+      {
+        "command": "aiAudit.reviewArchitecture",
+        "title": "ai_audit: プロジェクト全体のアーキテクチャを解析"
+      },
+      {
+        "command": "aiAudit.sendToCopilotChat",
+        "title": "Copilot Chat に修正依頼"
+      },
+      {
+        "command": "aiAudit.copyToClipboard",
+        "title": "クリップボードにコピー（AI修正依頼用）"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "aiAudit.auditCurrentFile",
+          "when": "resourceLangId == python",
+          "group": "ai_audit@1"
+        },
+        {
+          "command": "aiAudit.auditCurrentFileForce",
+          "when": "resourceLangId == python",
+          "group": "ai_audit@2"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "aiAudit.auditFolder",
+          "when": "explorerResourceIsFolder",
+          "group": "ai_audit@1"
+        },
+        {
+          "command": "aiAudit.auditCurrentFile",
+          "when": "resourceLangId == python",
+          "group": "ai_audit@2"
+        },
+        {
+          "command": "aiAudit.extractWhy",
+          "when": "explorerResourceIsFolder",
+          "group": "ai_audit@3"
+        },
+        {
+          "command": "aiAudit.reviewArchitecture",
+          "when": "explorerResourceIsFolder",
+          "group": "ai_audit@4"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}

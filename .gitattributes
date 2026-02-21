@@ -1,0 +1,4 @@
+# テキストファイルの改行コードを LF に統一（Windows での CRLF 変換を防ぐ）
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
