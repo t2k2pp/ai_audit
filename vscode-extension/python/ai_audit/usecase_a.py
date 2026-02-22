@@ -5,6 +5,9 @@
 セキュリティ・クリーンコードの2種のウェアでLLMに監査させる。
 結果はSQLiteに保存し、<ファイル名>_audit.json として出力する。
 
+対応言語: Python / JavaScript / TypeScript
+※ JS/TS監査はPython向けウェアを使用するため、JS/TS固有の観点は含まれません。
+
 単一ファイル: audit_file()
 フォルダ一括: audit_directory()
 """
@@ -12,7 +15,7 @@ import json
 import os
 import sys
 
-from .ast_parser import parse_chunks, scan_python_files
+from .ast_parser import get_lang, parse_chunks, scan_python_files, scan_source_files
 from .cache_manager import (
     compute_hash,
     get_audit_results,
@@ -80,9 +83,13 @@ def audit_file(file_path: str, force: bool = False) -> dict:
         truncated_code = truncate_to_limit(code)
         chunk_issues: list[dict] = []
 
+        lang = chunk.get("lang", "python")
+        lang_label = {"python": "Python", "javascript": "JavaScript", "typescript": "TypeScript"}.get(lang, "Python")
+        code_block_lang = {"python": "python", "javascript": "javascript", "typescript": "typescript"}.get(lang, "python")
+
         for wear_type in AUDIT_WEARS:
             system_prompt = get_wear(wear_type)
-            user_content = f"以下のPythonコードを監査してください:\n\n```python\n{truncated_code}\n```"
+            user_content = f"以下の{lang_label}コードを監査してください:\n\n```{code_block_lang}\n{truncated_code}\n```"
 
             try:
                 raw_response = call_llm(system_prompt, user_content, json_mode=True)
@@ -128,9 +135,9 @@ def audit_directory(
         print(f"[ERROR] ディレクトリが見つかりません: {abs_dir}", file=sys.stderr)
         return {}
 
-    py_files = list(scan_python_files(abs_dir))
+    py_files = list(scan_source_files(abs_dir))
     if not py_files:
-        print("[INFO] 対象のPythonファイルが見つかりませんでした。", file=sys.stderr)
+        print("[INFO] 対象のソースファイルが見つかりませんでした。", file=sys.stderr)
         return {}
 
     if output_dir:
@@ -158,7 +165,7 @@ def audit_directory(
         file_issue_count = sum(len(v) for v in results.values())
         total_issues += file_issue_count
 
-        # ファイルごとのJSONを出力
+        # ファイルごとのJSONを出力（拡張子を除いた名前に _audit.json を付与）
         if output_dir:
             # output_dir 指定時: ディレクトリ構造を保持してそこへ出力
             rel_no_ext = os.path.splitext(rel_path)[0]
@@ -224,6 +231,7 @@ def _build_summary(
 def save_audit_json(file_path: str, results: dict) -> str:
     """
     監査結果をJSONファイルに保存する（元ファイルと同じディレクトリへ出力）。
+    拡張子を除いたパスに _audit.json を付与する（.py / .js / .ts 等すべて対応）。
 
     Args:
         file_path: 元の監査対象ファイルパス

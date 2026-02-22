@@ -12,3 +12,7 @@ requests==2.32.3
 
 # .env ファイルの読み込み
 python-dotenv==1.0.1
+
+tree-sitter>=0.23
+tree-sitter-javascript
+tree-sitter-typescript

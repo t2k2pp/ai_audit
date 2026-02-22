@@ -3,81 +3,27 @@
 
 4096トークン制限内でAIに複数ファイルの全体像を把握させるため、
 実装ブロックを除去したスケルトンコードを生成し、アーキテクチャを評価させる。
+
+対応言語: Python / JavaScript / TypeScript
+※ JS/TSファイルが含まれる場合、JS/TS固有の観点は含まれない旨を出力に付記する。
 """
-import ast
 import os
 import sys
 from datetime import datetime
 
-from .ast_parser import scan_python_files
+from .ast_parser import generate_skeleton, get_lang, scan_python_files, scan_source_files
 from .llm_client import call_llm
 from .token_counter import DEFAULT_CHAR_LIMIT, is_within_limit, truncate_to_limit
 from .wear_manager import get_wear
 
+# JS/TS固有観点の制限付記
+_JSTS_NOTICE = """\
+> ⚠️ **JS/TS固有の観点について**
+> このレビューはPython向けウェアで生成されています。
+> 型の安全性、async/awaitの誤用、React Hooksルール等のJS/TS固有の観点については
+> 現在のウェアでは専門的な解析を行っていません。参考としてご活用ください。
 
-class _SkeletonTransformer(ast.NodeTransformer):
-    """
-    ASTトランスフォーマー: 実装ブロック（関数・メソッドの本体）を削除し、
-    クラス名・関数シグネチャ・Docstringのみを残したスケルトンに変換する。
-    """
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        return self._skeleton_function(node)
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
-        return self._skeleton_function(node)
-
-    def _skeleton_function(self, node):
-        """関数の本体をPassに置き換え、Docstringのみ残す。"""
-        new_body = []
-
-        # Docstringがあれば保持
-        if (
-            node.body
-            and isinstance(node.body[0], ast.Expr)
-            and isinstance(node.body[0].value, ast.Constant)
-            and isinstance(node.body[0].value.value, str)
-        ):
-            new_body.append(node.body[0])
-
-        # 実装の代わりに pass を入れる
-        new_body.append(ast.Pass())
-        node.body = new_body
-        return node
-
-
-def generate_skeleton(file_path: str) -> str:
-    """
-    指定ファイルのスケルトンコードを生成する。
-
-    Args:
-        file_path: 対象Pythonファイルパス
-
-    Returns:
-        スケルトンコード文字列（実装ブロック除去済み）
-        パースエラーの場合は空文字列
-    """
-    abs_path = os.path.abspath(file_path)
-    try:
-        with open(abs_path, "r", encoding="utf-8") as f:
-            source = f.read()
-    except UnicodeDecodeError:
-        with open(abs_path, "r", encoding="latin-1") as f:
-            source = f.read()
-
-    try:
-        tree = ast.parse(source, filename=abs_path)
-    except SyntaxError:
-        return ""
-
-    transformer = _SkeletonTransformer()
-    skeleton_tree = transformer.visit(tree)
-    ast.fix_missing_locations(skeleton_tree)
-
-    try:
-        return ast.unparse(skeleton_tree)
-    except Exception:
-        return ""
+"""
 
 
 def review_architecture(directory: str, output_file: str | None = None) -> str:
@@ -98,17 +44,21 @@ def review_architecture(directory: str, output_file: str | None = None) -> str:
     abs_dir = os.path.abspath(directory)
     wear_prompt = get_wear("architecture_reviewer")
 
-    # スケルトンコードを収集
+    # スケルトンコードを収集（Python / JS / TS）
     skeletons: list[str] = []
-    for file_path in scan_python_files(abs_dir):
+    has_jsts = False
+    for file_path in scan_source_files(abs_dir):
         skeleton = generate_skeleton(file_path)
         if not skeleton:
             continue
+        lang = get_lang(file_path)
+        if lang in ("javascript", "typescript"):
+            has_jsts = True
         rel_path = os.path.relpath(file_path, abs_dir)
         skeletons.append(f"=== File: {rel_path} ===\n{skeleton}")
 
     if not skeletons:
-        return "# アーキテクチャレビュー\n\n対象のPythonファイルが見つかりませんでした。"
+        return "# アーキテクチャレビュー\n\n対象のソースファイルが見つかりませんでした。"
 
     # トークン制限内でファイルをバッチにまとめる
     batches: list[str] = []
@@ -146,10 +96,17 @@ def review_architecture(directory: str, output_file: str | None = None) -> str:
 
     # 結果を結合してMarkdownレポートを作成
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    header = f"# アーキテクチャレビューレポート\n\n**対象ディレクトリ:** `{abs_dir}`\n**生成日時:** {timestamp}\n**対象ファイル数:** {len(skeletons)}\n\n---\n"
+    header = (
+        f"# アーキテクチャレビューレポート\n\n"
+        f"**対象ディレクトリ:** `{abs_dir}`  \n"
+        f"**生成日時:** {timestamp}  \n"
+        f"**対象ファイル数:** {len(skeletons)}\n\n"
+        f"---\n\n"
+    )
+    notice = _JSTS_NOTICE if has_jsts else ""
 
     if len(reviews) == 1:
-        report = header + reviews[0]
+        report = header + notice + reviews[0]
     else:
         # 複数バッチに分割された場合は、対象ファイル範囲を見出しに付ける
         files_per_batch = max(1, len(skeletons) // len(reviews))
@@ -160,7 +117,7 @@ def review_architecture(directory: str, output_file: str | None = None) -> str:
             if i == len(reviews) - 1:
                 end_file = len(skeletons)
             sections.append(f"## ファイル {start_file}〜{end_file} のレビュー\n\n{r}")
-        report = header + "\n\n---\n\n".join(sections)
+        report = header + notice + "\n\n---\n\n".join(sections)
 
     if output_file:
         with open(output_file, "w", encoding="utf-8") as f:

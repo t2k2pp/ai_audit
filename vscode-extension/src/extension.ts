@@ -27,8 +27,8 @@ const SUPPORTED_LANGUAGES: Array<{
   since: string;
 }> = [
   { id: "python",     label: "Python",     status: "supported", since: "v0.1.0" },
-  { id: "javascript", label: "JavaScript", status: "planned",   since: "-" },
-  { id: "typescript", label: "TypeScript", status: "planned",   since: "-" },
+  { id: "javascript", label: "JavaScript", status: "supported", since: "v0.3.0" },
+  { id: "typescript", label: "TypeScript", status: "supported", since: "v0.3.0" },
   { id: "go",         label: "Go",         status: "planned",   since: "-" },
   { id: "csharp",     label: "C#",         status: "planned",   since: "-" },
 ];
@@ -216,6 +216,24 @@ export function activate(context: vscode.ExtensionContext) {
       // 解析対象フォルダ内に _architecture.md を出力させる（--output フラグで指定）
       const outputMd = path.join(folderPath, "_architecture.md");
       runBackendCommand("review_architecture", [folderPath, "--output", outputMd], "reviewArchitecture");
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.generateDesignDoc", async (uri?: vscode.Uri) => {
+      // エクスプローラー右クリック → uri あり、コマンドパレット → フォルダ選択ダイアログ
+      let folderPath: string | undefined = uri?.fsPath;
+      if (!folderPath) {
+        const picked = await vscode.window.showOpenDialog({
+          canSelectFiles: false,
+          canSelectFolders: true,
+          canSelectMany: false,
+          openLabel: "このフォルダの設計書を生成する",
+        });
+        folderPath = picked?.[0]?.fsPath;
+      }
+      if (!folderPath) { return; }
+      runBackendCommand("generate_design_doc", [folderPath], "generateDesignDoc");
     })
   );
 
@@ -765,18 +783,20 @@ function decodeBuffer(chunks: Buffer[]): string {
 // ---------------------------------------------------------------------------
 // バックエンドコマンド汎用実行（extract-why / search-why / review-architecture）
 // ---------------------------------------------------------------------------
-type BackendCommandId = "extractWhy" | "searchWhy" | "reviewArchitecture";
+type BackendCommandId = "extractWhy" | "searchWhy" | "reviewArchitecture" | "generateDesignDoc";
 
 const BACKEND_COMMAND_LABELS: Record<BackendCommandId, string> = {
   extractWhy:          "設計思想を抽出中",
   searchWhy:           "設計思想を検索中",
   reviewArchitecture:  "アーキテクチャを解析中",
+  generateDesignDoc:   "設計書を生成中",
 };
 
 const BACKEND_COMMAND_TITLES: Record<BackendCommandId, string> = {
   extractWhy:          "ai_audit: 設計思想抽出",
   searchWhy:           "ai_audit: 設計思想検索",
   reviewArchitecture:  "ai_audit: アーキテクチャ解析",
+  generateDesignDoc:   "ai_audit: 設計書生成",
 };
 
 function runBackendCommand(
@@ -890,6 +910,13 @@ function runBackendCommand(
       // args = [folderPath, "--output", outputMdPath]
       const mdPath = args[2] ?? path.join(args[0], "_architecture.md");
       showMarkdownResultInWebview(title, mdPath);
+    } else if (commandId === "generateDesignDoc") {
+      // generate_design_doc は args[0] のフォルダ直下に両ファイルを書く
+      const folderPath = args[0];
+      const detailPath  = path.join(folderPath, "_design_detail.md");
+      const overviewPath = path.join(folderPath, "_design_overview.md");
+      showMarkdownResultInWebview("ai_audit: 詳細設計書", detailPath);
+      showMarkdownResultInWebview("ai_audit: 概要設計書", overviewPath);
     }
   });
 }

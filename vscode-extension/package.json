@@ -100,6 +100,10 @@
         "title": "ai_audit: プロジェクト全体のアーキテクチャを解析"
       },
       {
+        "command": "aiAudit.generateDesignDoc",
+        "title": "ai_audit: ドキュメント生成：設計書"
+      },
+      {
         "command": "aiAudit.sendToCopilotChat",
         "title": "Copilot Chat に修正依頼"
       },
@@ -141,6 +145,11 @@
           "command": "aiAudit.reviewArchitecture",
           "when": "explorerResourceIsFolder",
           "group": "ai_audit@4"
+        },
+        {
+          "command": "aiAudit.generateDesignDoc",
+          "when": "explorerResourceIsFolder",
+          "group": "ai_audit@5"
         }
       ]
     }

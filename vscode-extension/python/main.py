@@ -8,6 +8,7 @@ ai_audit - 120Bモデル×4096トークン環境向け 生成AI活用CLIツー�
   extract_why <directory>       ユースケースB: 設計思想の抽出・蓄積
   search_why "<query>"          ユースケースB: 設計思想の自然言語検索
   review_architecture <dir>     ユースケースC: ASTスケルトンによるアーキテクチャレビュー
+  generate_design_doc <dir>     ユースケースD: 設計書リバースビルド（詳細設計書・概要設計書を生成）
 """
 import argparse
 import io
@@ -189,6 +190,19 @@ def cmd_review_architecture(args: argparse.Namespace) -> None:
         print(report)
 
 
+def cmd_generate_design_doc(args: argparse.Namespace) -> None:
+    from ai_audit.config_manager import validate_env
+    validate_env()
+    from ai_audit.usecase_d import generate_design_doc
+    detail_path, overview_path = generate_design_doc(
+        args.directory,
+        output_dir=args.output_dir,
+        force=args.force,
+    )
+    print(f"[DONE] 詳細設計書: {detail_path}")
+    print(f"[DONE] 概要設計書: {overview_path}")
+
+
 # ---------------------------------------------------------------------------
 # パーサー定義
 # ---------------------------------------------------------------------------
@@ -309,6 +323,37 @@ def build_parser() -> argparse.ArgumentParser:
     p_review.add_argument("--output", "-o", default=None,
                           help="レポートを保存するMarkdownファイルパス（省略時は標準出力）")
     p_review.set_defaults(func=cmd_review_architecture)
+
+    # --- generate_design_doc ---
+    p_design = subparsers.add_parser(
+        "generate_design_doc",
+        help="ユースケースD: ソースコードから設計書をリバースビルドする（詳細設計書・概要設計書を生成）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+出力ファイル（対象ディレクトリまたは --output-dir 直下）:
+  _design_detail.md   内部（詳細）設計書: クラス図・関数一覧・データフロー等
+  _design_overview.md 外部（概要）設計書: システム概要・ユースケース・構成図等
+
+再開機能:
+  _design_detail.md が存在する場合は詳細生成をスキップし概要生成のみ実行します。
+  最初からやり直す場合は --force を指定してください。
+
+対応言語:
+  Python (.py) / JavaScript (.js / .jsx) / TypeScript (.ts / .tsx)
+  ※ JS/TS が含まれる場合は JS/TS固有の観点に関する付記が出力に追加されます。
+
+例:
+  main.py generate_design_doc ./src
+  main.py generate_design_doc ./src --output-dir ./docs
+  main.py generate_design_doc ./src --force
+""",
+    )
+    p_design.add_argument("directory", help="対象ソースディレクトリ")
+    p_design.add_argument("--output-dir", dest="output_dir", default=None, metavar="DIR",
+                          help="設計書の出力先ディレクトリ（省略時は対象ディレクトリ直下）")
+    p_design.add_argument("--force", action="store_true", default=False,
+                          help="既存の設計書を無視して全体を再生成する")
+    p_design.set_defaults(func=cmd_generate_design_doc)
 
     return parser
 
