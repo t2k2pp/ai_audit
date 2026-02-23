@@ -186,6 +186,29 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.extractWhyForce", async (uri?: vscode.Uri) => {
+      const cfg = vscode.workspace.getConfiguration("aiAudit");
+      if (!cfg.get<boolean>("enableWhyFeature", false)) {
+        const action = await vscode.window.showInformationMessage(
+          "ai_audit: 設計思想機能はまだ有効になっていません。セットアップを実行しますか？",
+          "セットアップする",
+          "キャンセル"
+        );
+        if (action === "セットアップする") {
+          await setupWhyFeature();
+        }
+        return;
+      }
+      const folderPath = uri?.fsPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!folderPath) {
+        vscode.window.showWarningMessage("ai_audit: ワークスペースを開いた状態で実行してください。");
+        return;
+      }
+      runBackendCommand("extract_why", [folderPath, "--force"], "extractWhy");
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand("aiAudit.searchWhy", async () => {
       const cfg = vscode.workspace.getConfiguration("aiAudit");
       if (!cfg.get<boolean>("enableWhyFeature", false)) {

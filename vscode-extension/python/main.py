@@ -170,7 +170,7 @@ def cmd_extract_why(args: argparse.Namespace) -> None:
     from ai_audit.config_manager import validate_env
     validate_env()
     from ai_audit.usecase_b import extract_why
-    extract_why(args.directory)
+    extract_why(args.directory, force=args.force)
 
 
 def cmd_search_why(args: argparse.Namespace) -> None:
@@ -307,8 +307,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_extract = subparsers.add_parser(
         "extract_why",
         help="ユースケースB: ディレクトリ内の全関数の設計思想を抽出してDBに蓄積する",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+変更検知:
+  コードが変更された関数のみ自動的に再抽出します（content_hash で検知）。
+  変更のない関数はスキップされるため、API コストを節約できます。
+  --force を指定すると変更の有無に関わらず全件を再抽出します。
+""",
     )
     p_extract.add_argument("directory", help="スキャン対象のディレクトリ")
+    p_extract.add_argument("--force", action="store_true", default=False,
+                           help="変更の有無に関わらず全件を再抽出する")
     p_extract.set_defaults(func=cmd_extract_why)
 
     # --- search_why ---

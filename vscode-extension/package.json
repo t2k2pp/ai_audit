@@ -99,7 +99,11 @@
       },
       {
         "command": "aiAudit.extractWhy",
-        "title": "ai_audit: このファイルの設計思想を抽出"
+        "title": "ai_audit: 設計思想を抽出（変更分のみ）"
+      },
+      {
+        "command": "aiAudit.extractWhyForce",
+        "title": "ai_audit: 設計思想を全件再抽出（--force）"
       },
       {
         "command": "aiAudit.searchWhy",
@@ -169,14 +173,19 @@
           "group": "ai_audit@3"
         },
         {
-          "command": "aiAudit.reviewArchitecture",
+          "command": "aiAudit.extractWhyForce",
           "when": "explorerResourceIsFolder",
           "group": "ai_audit@4"
         },
         {
-          "command": "aiAudit.generateDesignDoc",
+          "command": "aiAudit.reviewArchitecture",
           "when": "explorerResourceIsFolder",
           "group": "ai_audit@5"
+        },
+        {
+          "command": "aiAudit.generateDesignDoc",
+          "when": "explorerResourceIsFolder",
+          "group": "ai_audit@6"
         }
       ],
       "view/title": [

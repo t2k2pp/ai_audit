@@ -6,6 +6,7 @@ extract_why: ディレクトリ内の全関数から「なぜそのように書�
 
 search_why:  自然言語クエリでベクトル検索し、関連する設計思想を返す。
 """
+import hashlib
 import os
 import sys
 from datetime import datetime, timezone
@@ -39,17 +40,30 @@ def _get_chroma_client():
     return collection
 
 
-def extract_why(directory: str) -> None:
+def _content_hash(code: str) -> str:
+    """コード文字列の SHA-256 ハッシュ（先頭16文字）を返す。"""
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()[:16]
+
+
+def extract_why(directory: str, force: bool = False) -> None:
     """
-    指定ディレクトリ内の全Pythonファイルから設計思想を抽出し、
+    指定ディレクトリ内の全ソースファイルから設計思想を抽出し、
     ChromaDBに保存する（バッチ実行）。
+
+    変更検知ロジック:
+      - 新規関数      → 抽出して追加
+      - コード変更あり → 再抽出して上書き（content_hash で検知）
+      - コード変更なし → スキップ（API コスト節約）
+      - force=True    → ハッシュに関わらず全件再抽出
 
     Args:
         directory: スキャン対象ディレクトリ
+        force:     True の場合は変更有無に関わらず全件再抽出する
     """
     collection = _get_chroma_client()
     wear_prompt = get_wear("why_extractor")
     processed = 0
+    updated = 0
     skipped = 0
 
     for file_path in scan_source_files(directory):
@@ -58,35 +72,57 @@ def extract_why(directory: str) -> None:
             chunk_id = chunk["chunk_id"]
             code = chunk["code"]
             truncated_code = truncate_to_limit(code)
+            current_hash = _content_hash(code)
 
-            # 既存エントリの確認（冪等性）
-            existing = collection.get(ids=[chunk_id])
-            if existing["ids"]:
-                skipped += 1
-                continue
+            # 既存エントリの確認（コンテンツハッシュで変更検知）
+            if not force:
+                existing = collection.get(ids=[chunk_id], include=["metadatas"])
+                if existing["ids"]:
+                    stored_hash = existing["metadatas"][0].get("content_hash", "")
+                    if stored_hash == current_hash:
+                        skipped += 1
+                        continue
+                    # ハッシュが違う → コードが変更されているので再抽出
+                    print(f"  [UPDATE] {chunk['name']}: コード変更を検知、再抽出します")
 
-            user_content = f"以下のPythonコードの設計思想を分析してください:\n\n```python\n{truncated_code}\n```"
+            lang = chunk.get("lang", "python")
+            user_content = (
+                f"以下の {lang} コードの設計思想を分析してください:\n\n"
+                f"```{lang}\n{truncated_code}\n```"
+            )
 
             try:
                 why_text = call_llm(wear_prompt, user_content, json_mode=False)
                 print(f"  [EXTRACT] {chunk['name']}: {why_text[:60]}...")
 
-                collection.add(
+                metadata = {
+                    "file_path": os.path.relpath(file_path, directory),
+                    "function_name": chunk["name"],
+                    "chunk_type": chunk["type"],
+                    "content_hash": current_hash,
+                    "extracted_at": datetime.now(timezone.utc).isoformat(),
+                }
+
+                # upsert: 新規追加 or 上書き更新（chunk_id が存在すれば更新）
+                collection.upsert(
                     ids=[chunk_id],
                     documents=[why_text],
-                    metadatas=[{
-                        "file_path": os.path.relpath(file_path, directory),
-                        "function_name": chunk["name"],
-                        "chunk_type": chunk["type"],
-                        "extracted_at": datetime.now(timezone.utc).isoformat(),
-                    }],
+                    metadatas=[metadata],
                 )
-                processed += 1
+
+                # 新規 or 更新の判別
+                existing_check = collection.get(ids=[chunk_id], include=["metadatas"])
+                stored_hash_after = existing_check["metadatas"][0].get("content_hash", "") if existing_check["ids"] else ""
+                if stored_hash_after == current_hash and not force:
+                    updated += 1
+                else:
+                    processed += 1
 
             except RuntimeError as e:
                 print(f"  [ERROR] {chunk['name']}: {e}", file=sys.stderr)
 
-    print(f"\n[INFO] 完了: {processed} 件を抽出・保存, {skipped} 件はスキップ（既存）")
+    total_written = processed + updated
+    print(f"\n[INFO] 完了: {total_written} 件を保存（新規: {processed}, 更新: {updated}）, {skipped} 件はスキップ（変更なし）")
 
 
 def search_why(query: str, top_k: int = 5) -> list[dict]:
