@@ -51,6 +51,16 @@
           "type": "string",
           "default": "python",
           "markdownDescription": "設計思想機能で使用する Python のパス\n\n通常は `python` のままでOKです。"
+        },
+        "aiAudit.showWhyLens": {
+          "type": "boolean",
+          "default": false,
+          "description": "設計思想を関数・クラスの上に薄く表示する（CodeLens）。設計思想機能が有効な場合のみ動作します。"
+        },
+        "aiAudit.showAuditDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "監査結果の波線表示を有効にする（OFF にすると波線が非表示になります）"
         }
       }
     },
@@ -104,6 +114,23 @@
         "title": "ai_audit: ドキュメント生成：設計書"
       },
       {
+        "command": "aiAudit.listWhy",
+        "title": "ai_audit: 蓄積済み設計思想を一覧表示"
+      },
+      {
+        "command": "aiAudit.toggleWhyLens",
+        "title": "ai_audit: 設計思想 CodeLens の ON/OFF を切り替え"
+      },
+      {
+        "command": "aiAudit.toggleAuditDiagnostics",
+        "title": "ai_audit: 監査波線表示の ON/OFF を切り替え"
+      },
+      {
+        "command": "aiAudit.refreshWhyView",
+        "title": "設計思想を再読み込み",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "aiAudit.sendToCopilotChat",
         "title": "Copilot Chat に修正依頼"
       },
@@ -150,6 +177,31 @@
           "command": "aiAudit.generateDesignDoc",
           "when": "explorerResourceIsFolder",
           "group": "ai_audit@5"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "aiAudit.refreshWhyView",
+          "when": "view == aiAuditWhyView",
+          "group": "navigation"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "aiAuditSidebar",
+          "title": "ai_audit",
+          "icon": "$(shield)"
+        }
+      ]
+    },
+    "views": {
+      "aiAuditSidebar": [
+        {
+          "id": "aiAuditWhyView",
+          "name": "設計思想一覧",
+          "when": "config.aiAudit.enableWhyFeature"
         }
       ]
     }

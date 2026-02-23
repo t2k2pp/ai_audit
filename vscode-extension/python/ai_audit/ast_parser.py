@@ -2,6 +2,7 @@
 ASTパーサー: Python / JavaScript / TypeScript / Dart ソースコードを関数・クラス単位にチャンク化する
 """
 import ast
+import fnmatch
 import os
 from typing import Generator
 
@@ -11,6 +12,68 @@ _JS_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx"}
 _DART_EXTENSIONS = {".dart"}
 # 除外ディレクトリ
 _EXCLUDE_DIRS = {"__pycache__", ".venv", "venv", ".git", "node_modules", "dist", "build", ".next"}
+
+# ---------------------------------------------------------------------------
+# .aiauditignore サポート
+# ---------------------------------------------------------------------------
+
+def load_aiauditignore(directory: str) -> list[str]:
+    """
+    指定ディレクトリの .aiauditignore ファイルを読み込み、パターンリストを返す。
+    ファイルが存在しない場合は空リストを返す。
+
+    .aiauditignore の書式（.gitignore と同様）:
+      - # で始まる行はコメント
+      - 空行は無視
+      - * はファイル名内の任意の文字列にマッチ
+      - ** はディレクトリ区切りを含む任意のパスにマッチ
+      - 末尾の / はディレクトリのみをマッチ（現実装では / を除いたパターンとして扱う）
+    """
+    ignore_path = os.path.join(os.path.abspath(directory), ".aiauditignore")
+    if not os.path.exists(ignore_path):
+        return []
+    patterns = []
+    try:
+        with open(ignore_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n\r")
+                if line.startswith("#") or not line.strip():
+                    continue
+                # 末尾スラッシュはディレクトリ指定なので除去してパターンとして使用
+                patterns.append(line.rstrip("/"))
+    except OSError:
+        pass
+    return patterns
+
+
+def is_ignored(file_path: str, root_dir: str, patterns: list[str]) -> bool:
+    """
+    ファイルパスが .aiauditignore のパターンにマッチするかどうかを返す。
+
+    Args:
+        file_path: チェック対象ファイルの絶対パス
+        root_dir:  .aiauditignore が存在するルートディレクトリの絶対パス
+        patterns:  load_aiauditignore() が返したパターンリスト
+
+    Returns:
+        True ならば除外対象
+    """
+    if not patterns:
+        return False
+    # ルートからの相対パス（区切り文字を / に統一）
+    rel = os.path.relpath(file_path, root_dir).replace(os.sep, "/")
+    for pattern in patterns:
+        # パターン自体に / が含まれない場合: ファイル名のみでマッチ
+        if "/" not in pattern:
+            if fnmatch.fnmatch(os.path.basename(file_path), pattern):
+                return True
+        # パターンに / がある場合: 相対パス全体でマッチ（** も考慮）
+        if fnmatch.fnmatch(rel, pattern):
+            return True
+        # パターンがディレクトリ prefix の場合（例: build_tmp → build_tmp/以下全て）
+        if rel.startswith(pattern + "/"):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +128,7 @@ def generate_skeleton(file_path: str) -> str:
 def scan_python_files(directory: str) -> Generator[str, None, None]:
     """
     ディレクトリを再帰スキャンしてPythonファイルのパスを返す（後方互換維持）。
+    .aiauditignore が存在する場合はそのパターンに従って除外する。
 
     Args:
         directory: スキャン対象ディレクトリ
@@ -73,16 +137,20 @@ def scan_python_files(directory: str) -> Generator[str, None, None]:
         Pythonファイルの絶対パス
     """
     abs_dir = os.path.abspath(directory)
+    patterns = load_aiauditignore(abs_dir)
     for root, dirs, files in os.walk(abs_dir):
         dirs[:] = [d for d in dirs if d not in _EXCLUDE_DIRS]
         for filename in files:
             if filename.endswith(".py"):
-                yield os.path.join(root, filename)
+                full_path = os.path.join(root, filename)
+                if not is_ignored(full_path, abs_dir, patterns):
+                    yield full_path
 
 
 def scan_js_files(directory: str) -> Generator[str, None, None]:
     """
     ディレクトリを再帰スキャンしてJS/TSファイルのパスを返す。
+    .aiauditignore が存在する場合はそのパターンに従って除外する。
 
     Args:
         directory: スキャン対象ディレクトリ
@@ -91,16 +159,20 @@ def scan_js_files(directory: str) -> Generator[str, None, None]:
         JS/TSファイルの絶対パス（.js / .jsx / .ts / .tsx）
     """
     abs_dir = os.path.abspath(directory)
+    patterns = load_aiauditignore(abs_dir)
     for root, dirs, files in os.walk(abs_dir):
         dirs[:] = [d for d in dirs if d not in _EXCLUDE_DIRS]
         for filename in files:
             if os.path.splitext(filename)[1].lower() in _JS_EXTENSIONS:
-                yield os.path.join(root, filename)
+                full_path = os.path.join(root, filename)
+                if not is_ignored(full_path, abs_dir, patterns):
+                    yield full_path
 
 
 def scan_source_files(directory: str) -> Generator[str, None, None]:
     """
     ディレクトリを再帰スキャンしてPython・JS/TS・Dartファイルのパスを返す。
+    .aiauditignore が存在する場合はそのパターンに従って除外する。
 
     Args:
         directory: スキャン対象ディレクトリ
@@ -109,12 +181,15 @@ def scan_source_files(directory: str) -> Generator[str, None, None]:
         ソースファイルの絶対パス（.py / .js / .jsx / .ts / .tsx / .dart）
     """
     abs_dir = os.path.abspath(directory)
+    patterns = load_aiauditignore(abs_dir)
     for root, dirs, files in os.walk(abs_dir):
         dirs[:] = [d for d in dirs if d not in _EXCLUDE_DIRS]
         for filename in files:
             ext = os.path.splitext(filename)[1].lower()
             if ext == ".py" or ext in _JS_EXTENSIONS or ext in _DART_EXTENSIONS:
-                yield os.path.join(root, filename)
+                full_path = os.path.join(root, filename)
+                if not is_ignored(full_path, abs_dir, patterns):
+                    yield full_path
 
 
 def get_lang(file_path: str) -> str:

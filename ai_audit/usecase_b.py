@@ -10,7 +10,7 @@ import os
 import sys
 from datetime import datetime, timezone
 
-from .ast_parser import parse_chunks, scan_python_files
+from .ast_parser import parse_chunks, scan_source_files
 from .llm_client import call_llm
 from .token_counter import truncate_to_limit
 from .wear_manager import get_wear
@@ -52,7 +52,7 @@ def extract_why(directory: str) -> None:
     processed = 0
     skipped = 0
 
-    for file_path in scan_python_files(directory):
+    for file_path in scan_source_files(directory):
         chunks = parse_chunks(file_path)
         for chunk in chunks:
             chunk_id = chunk["chunk_id"]
@@ -133,6 +133,69 @@ def search_why(query: str, top_k: int = 5) -> list[dict]:
         })
 
     return output
+
+
+def list_why() -> list[dict]:
+    """
+    ChromaDB に蓄積されている全エントリを返す。
+
+    Returns:
+        エントリの辞書リスト。各辞書:
+          - index: 順位（1始まり）
+          - file_path: ファイルパス
+          - function_name: 関数名
+          - chunk_type: "function" または "class"
+          - why_text: 設計思想テキスト
+          - extracted_at: 抽出日時（ISO 8601）
+    """
+    collection = _get_chroma_client()
+    total = collection.count()
+    if total == 0:
+        return []
+
+    results = collection.get(
+        include=["documents", "metadatas"],
+        limit=total,
+    )
+
+    if not results["ids"]:
+        return []
+
+    output = []
+    for i, (doc_id, document, metadata) in enumerate(zip(
+        results["ids"],
+        results["documents"],
+        results["metadatas"],
+    )):
+        output.append({
+            "index": i + 1,
+            "file_path": metadata.get("file_path", ""),
+            "function_name": metadata.get("function_name", ""),
+            "chunk_type": metadata.get("chunk_type", ""),
+            "why_text": document,
+            "extracted_at": metadata.get("extracted_at", ""),
+        })
+
+    # ファイルパス → 関数名 の順にソート
+    output.sort(key=lambda x: (x["file_path"], x["function_name"]))
+    for i, item in enumerate(output):
+        item["index"] = i + 1
+
+    return output
+
+
+def print_list_results(results: list[dict]) -> None:
+    """list_why の結果をターミナルに見やすく表示する。"""
+    if not results:
+        print("蓄積された設計思想がありません。まず extract_why を実行してください。")
+        return
+
+    print(f"\n[INFO] 蓄積済み設計思想: {len(results)} 件")
+    for item in results:
+        print(f"\n--- #{item['index']} [{item['chunk_type']}] {item['function_name']} ---")
+        print(f"ファイル   : {item['file_path']}")
+        print(f"抽出日時   : {item['extracted_at']}")
+        print(f"設計思想   :\n{item['why_text']}")
 
 
 def print_search_results(results: list[dict]) -> None:

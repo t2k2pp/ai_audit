@@ -41,6 +41,10 @@ const runningAudits = new Set<string>();
 let statusBarItem: vscode.StatusBarItem;
 let extensionPath: string;
 
+// 設計思想 CodeLens + TreeView 用
+let whyLensProvider: AiAuditWhyLensProvider | undefined;
+let whyTreeProvider: AiAuditWhyTreeProvider | undefined;
+
 // ---------------------------------------------------------------------------
 // 有効化エントリポイント
 // ---------------------------------------------------------------------------
@@ -294,6 +298,118 @@ export function activate(context: vscode.ExtensionContext) {
       new AiAuditCodeActionProvider(),
       { providedCodeActionKinds: AiAuditCodeActionProvider.providedKinds }
     )
+  );
+
+  // ---------------------------------------------------------------------------
+  // 設計思想 CodeLens プロバイダー登録
+  // ---------------------------------------------------------------------------
+  whyLensProvider = new AiAuditWhyLensProvider();
+  context.subscriptions.push(
+    vscode.languages.registerCodeLensProvider(
+      supportedLanguageIds,
+      whyLensProvider
+    )
+  );
+
+  // ---------------------------------------------------------------------------
+  // 設計思想 TreeView プロバイダー登録
+  // ---------------------------------------------------------------------------
+  whyTreeProvider = new AiAuditWhyTreeProvider();
+  const treeView = vscode.window.createTreeView("aiAuditWhyView", {
+    treeDataProvider: whyTreeProvider,
+    showCollapseAll: true,
+  });
+  context.subscriptions.push(treeView);
+
+  // ---------------------------------------------------------------------------
+  // 設計思想一覧コマンド
+  // ---------------------------------------------------------------------------
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.listWhy", async () => {
+      const cfg = vscode.workspace.getConfiguration("aiAudit");
+      if (!cfg.get<boolean>("enableWhyFeature", false)) {
+        const action = await vscode.window.showInformationMessage(
+          "ai_audit: 設計思想機能はまだ有効になっていません。セットアップを実行しますか？",
+          "セットアップする",
+          "キャンセル"
+        );
+        if (action === "セットアップする") { await setupWhyFeature(); }
+        return;
+      }
+      runBackendCommand("list_why", [], "listWhy");
+    })
+  );
+
+  // ---------------------------------------------------------------------------
+  // CodeLens ON/OFF 切り替えコマンド
+  // ---------------------------------------------------------------------------
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.toggleWhyLens", async () => {
+      const cfg = vscode.workspace.getConfiguration("aiAudit");
+      const current = cfg.get<boolean>("showWhyLens", false);
+      await cfg.update("showWhyLens", !current, vscode.ConfigurationTarget.Global);
+      vscode.window.showInformationMessage(
+        `ai_audit: 設計思想 CodeLens を${!current ? "ON" : "OFF"} にしました。`
+      );
+      whyLensProvider?.refresh();
+    })
+  );
+
+  // ---------------------------------------------------------------------------
+  // 監査波線 ON/OFF 切り替えコマンド
+  // ---------------------------------------------------------------------------
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.toggleAuditDiagnostics", async () => {
+      const cfg = vscode.workspace.getConfiguration("aiAudit");
+      const current = cfg.get<boolean>("showAuditDiagnostics", true);
+      await cfg.update("showAuditDiagnostics", !current, vscode.ConfigurationTarget.Global);
+      if (!current) {
+        vscode.window.showInformationMessage("ai_audit: 監査波線表示を ON にしました。");
+      } else {
+        diagnosticCollection.clear();
+        vscode.window.showInformationMessage("ai_audit: 監査波線表示を OFF にしました。");
+      }
+    })
+  );
+
+  // ---------------------------------------------------------------------------
+  // TreeView 再読み込みコマンド
+  // ---------------------------------------------------------------------------
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiAudit.refreshWhyView", () => {
+      whyTreeProvider?.refresh();
+    })
+  );
+
+  // ---------------------------------------------------------------------------
+  // 設計思想詳細ポップアップ（CodeLens クリック / TreeView クリック）
+  // ---------------------------------------------------------------------------
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "aiAudit.showWhyDetail",
+      (whyText: string, funcName: string) => {
+        showWebview(
+          `💡 設計思想: ${funcName}`,
+          `<style>
+            body { font-family: var(--vscode-font-family); padding: 16px; line-height: 1.7; }
+            h2 { color: var(--vscode-textLink-foreground); }
+            pre { background: var(--vscode-textBlockQuote-background);
+                  padding: 12px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; }
+          </style>
+          <h2>💡 ${escapeHtml(funcName)}</h2>
+          <pre>${escapeHtml(whyText)}</pre>`
+        );
+      }
+    )
+  );
+
+  // 設定変更時に CodeLens を更新
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("aiAudit.showWhyLens")) {
+        whyLensProvider?.refresh();
+      }
+    })
   );
 }
 
@@ -708,6 +824,11 @@ function applyDiagnostics(filePath: string, auditResult: {
   }>;
 }): void {
   const cfg = vscode.workspace.getConfiguration("aiAudit");
+  // 監査波線表示が OFF の場合は何もしない
+  if (!cfg.get<boolean>("showAuditDiagnostics", true)) {
+    diagnosticCollection.set(vscode.Uri.file(filePath), []);
+    return;
+  }
   const showInfo = cfg.get<boolean>("showInformationDiagnostics", false);
 
   const diagnostics: vscode.Diagnostic[] = [];
@@ -783,11 +904,12 @@ function decodeBuffer(chunks: Buffer[]): string {
 // ---------------------------------------------------------------------------
 // バックエンドコマンド汎用実行（extract-why / search-why / review-architecture）
 // ---------------------------------------------------------------------------
-type BackendCommandId = "extractWhy" | "searchWhy" | "reviewArchitecture" | "generateDesignDoc";
+type BackendCommandId = "extractWhy" | "searchWhy" | "listWhy" | "reviewArchitecture" | "generateDesignDoc";
 
 const BACKEND_COMMAND_LABELS: Record<BackendCommandId, string> = {
   extractWhy:          "設計思想を抽出中",
   searchWhy:           "設計思想を検索中",
+  listWhy:             "設計思想を読み込み中",
   reviewArchitecture:  "アーキテクチャを解析中",
   generateDesignDoc:   "設計書を生成中",
 };
@@ -795,6 +917,7 @@ const BACKEND_COMMAND_LABELS: Record<BackendCommandId, string> = {
 const BACKEND_COMMAND_TITLES: Record<BackendCommandId, string> = {
   extractWhy:          "ai_audit: 設計思想抽出",
   searchWhy:           "ai_audit: 設計思想検索",
+  listWhy:             "ai_audit: 設計思想一覧",
   reviewArchitecture:  "ai_audit: アーキテクチャ解析",
   generateDesignDoc:   "ai_audit: 設計書生成",
 };
@@ -838,9 +961,9 @@ function runBackendCommand(
   let spawnArgs: string[];
   let spawnCwd: string;
 
-  // extractWhy/searchWhy のみ Python 直接実行（chromadb が必要なため）
+  // extractWhy/searchWhy/listWhy のみ Python 直接実行（chromadb が必要なため）
   // reviewArchitecture はバイナリで実行
-  const needsPython = commandId === "extractWhy" || commandId === "searchWhy";
+  const needsPython = commandId === "extractWhy" || commandId === "searchWhy" || commandId === "listWhy";
   if (needsPython) {
     const pythonPath = cfg.get<string>("pythonPath", "python").trim();
     const mainPyPath = path.join(extensionPath, "python", "main.py");
@@ -902,8 +1025,14 @@ function runBackendCommand(
     if (commandId === "extractWhy") {
       const jsonPath = args[0].replace(/\.py$/, "_why.json");
       showJsonResultInWebview(title, jsonPath);
+      // TreeView も更新
+      whyTreeProvider?.refresh();
+      whyLensProvider?.refresh();
     } else if (commandId === "searchWhy") {
       // search-why は stdout に結果を出力する
+      showTextResultInWebview(title, stdout || stderr);
+    } else if (commandId === "listWhy") {
+      // list_why は stdout に結果を出力する
       showTextResultInWebview(title, stdout || stderr);
     } else if (commandId === "reviewArchitecture") {
       // review-architecture は --output で指定したパスにファイルを書く
@@ -1152,6 +1281,222 @@ function runPythonCheck(pythonPath: string, args: string[]): Promise<boolean> {
     proc.on("error", () => resolve(false));
     setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } resolve(false); }, 8000);
   });
+}
+
+// ---------------------------------------------------------------------------
+// 設計思想 CodeLens プロバイダー
+// 関数・クラスの定義行の上に「💡 設計思想: ...」を薄く表示する
+// ---------------------------------------------------------------------------
+
+/**
+ * _why.json ファイルから設計思想エントリを読み込み、キャッシュする。
+ * キャッシュキー: ファイルパス (without _why.json suffix)
+ */
+const _whyCache = new Map<string, Array<{ name: string; why: string; lineno?: number }>>();
+
+function _loadWhyCache(sourceFilePath: string): Array<{ name: string; why: string; lineno?: number }> {
+  const whyJsonPath = sourceFilePath.replace(/\.(py|js|jsx|ts|tsx|dart)$/, "_why.json");
+  if (!fs.existsSync(whyJsonPath)) { return []; }
+  const cached = _whyCache.get(sourceFilePath);
+  if (cached) { return cached; }
+  try {
+    const data: Array<{ chunk_id: string; why: string }> = JSON.parse(
+      fs.readFileSync(whyJsonPath, "utf-8")
+    );
+    const entries = data.map((item) => ({
+      name: item.chunk_id.split(":").pop() ?? "",
+      why:  item.why ?? "",
+    }));
+    _whyCache.set(sourceFilePath, entries);
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
+class AiAuditWhyLensProvider implements vscode.CodeLensProvider {
+  private _onDidChangeCodeLenses = new vscode.EventEmitter<void>();
+  readonly onDidChangeCodeLenses = this._onDidChangeCodeLenses.event;
+
+  refresh(): void {
+    _whyCache.clear();
+    this._onDidChangeCodeLenses.fire();
+  }
+
+  provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
+    const cfg = vscode.workspace.getConfiguration("aiAudit");
+    if (!cfg.get<boolean>("showWhyLens", false)) { return []; }
+    if (!cfg.get<boolean>("enableWhyFeature", false)) { return []; }
+
+    const entries = _loadWhyCache(document.uri.fsPath);
+    if (entries.length === 0) { return []; }
+
+    const lenses: vscode.CodeLens[] = [];
+    const fileLines = document.getText().split("\n");
+
+    // 関数・クラス定義行を探す（Python: def/class, JS/TS: function/class/const ... =, Dart: class）
+    const DEF_PATTERN = /^\s*(def|async\s+def|class|function\s+|export\s+(default\s+)?(function|class)|const\s+\w+\s*=\s*(async\s+)?\(|[A-Za-z_]\w*\s+[A-Za-z_]\w*\s*\()/;
+
+    for (let lineIdx = 0; lineIdx < fileLines.length; lineIdx++) {
+      const line = fileLines[lineIdx];
+      const defMatch = DEF_PATTERN.exec(line);
+      if (!defMatch) { continue; }
+
+      // 行から関数/クラス名を抽出
+      let nameMatch: RegExpMatchArray | null = null;
+      // Python: def func_name / class ClassName
+      nameMatch = line.match(/(?:def|class)\s+([A-Za-z_]\w*)/);
+      if (!nameMatch) {
+        // JS/TS: function funcName / class ClassName
+        nameMatch = line.match(/(?:function|class)\s+([A-Za-z_]\w*)/);
+      }
+      if (!nameMatch) {
+        // JS/TS: const funcName =
+        nameMatch = line.match(/const\s+([A-Za-z_]\w*)\s*=/);
+      }
+      if (!nameMatch) { continue; }
+
+      const funcName = nameMatch[1];
+      const entry = entries.find((e) => e.name === funcName);
+      if (!entry) { continue; }
+
+      // 1行目を抽出（最大60文字）
+      const firstLine = entry.why.split("\n")[0].trim();
+      const snippet   = firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine;
+
+      const range = new vscode.Range(lineIdx, 0, lineIdx, 0);
+      const lens  = new vscode.CodeLens(range, {
+        title:     `💡 設計思想: ${snippet}`,
+        command:   "aiAudit.showWhyDetail",
+        arguments: [entry.why, funcName],
+      });
+      lenses.push(lens);
+    }
+
+    return lenses;
+  }
+}
+
+// 設計思想詳細表示コマンド（CodeLens クリック時）は activate() 外でも登録できるよう遅延登録
+// → activate() 内で登録済みなので不要だが、クラス外に定義して activate に入れる
+
+// ---------------------------------------------------------------------------
+// 設計思想 TreeView プロバイダー（サイドパネル一覧）
+// ---------------------------------------------------------------------------
+
+/** TreeView のノード: ファイルノード or 関数ノード */
+class WhyTreeItem extends vscode.TreeItem {
+  constructor(
+    label: string,
+    public readonly kind: "file" | "entry",
+    collapsibleState: vscode.TreeItemCollapsibleState,
+    public readonly filePath?: string,
+    public readonly whyText?: string,
+    public readonly funcName?: string,
+  ) {
+    super(label, collapsibleState);
+    if (kind === "file") {
+      this.iconPath = new vscode.ThemeIcon("file-code");
+      this.contextValue = "whyFile";
+    } else {
+      this.iconPath = new vscode.ThemeIcon("lightbulb");
+      this.contextValue = "whyEntry";
+      this.tooltip = whyText;
+      // クリックで詳細表示
+      this.command = {
+        command: "aiAudit.showWhyDetail",
+        title:   "設計思想を表示",
+        arguments: [whyText ?? "", funcName ?? ""],
+      };
+    }
+  }
+}
+
+class AiAuditWhyTreeProvider implements vscode.TreeDataProvider<WhyTreeItem> {
+  private _onDidChangeTreeData = new vscode.EventEmitter<WhyTreeItem | undefined | void>();
+  readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+
+  /** ワークスペース内の _why.json ファイルを再スキャンして TreeView を更新 */
+  refresh(): void {
+    _whyCache.clear();
+    this._onDidChangeTreeData.fire();
+  }
+
+  getTreeItem(element: WhyTreeItem): vscode.TreeItem {
+    return element;
+  }
+
+  async getChildren(element?: WhyTreeItem): Promise<WhyTreeItem[]> {
+    if (!element) {
+      // ルートレベル: ワークスペース内の _why.json を探してファイルノードを返す
+      return this._getFileNodes();
+    }
+
+    if (element.kind === "file" && element.filePath) {
+      // ファイルノードの子: 各関数エントリ
+      return this._getEntryNodes(element.filePath);
+    }
+
+    return [];
+  }
+
+  private _getFileNodes(): WhyTreeItem[] {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length === 0) { return []; }
+
+    const items: WhyTreeItem[] = [];
+    for (const folder of folders) {
+      this._scanWhyJsonFiles(folder.uri.fsPath, items);
+    }
+    return items;
+  }
+
+  private _scanWhyJsonFiles(dir: string, items: WhyTreeItem[]): void {
+    const SKIP_DIRS = new Set(["node_modules", ".git", "__pycache__", "build_tmp", "dist", ".venv", "venv"]);
+    let entries: string[];
+    try { entries = fs.readdirSync(dir); } catch { return; }
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry);
+      try {
+        const stat = fs.statSync(fullPath);
+        if (stat.isDirectory()) {
+          if (!SKIP_DIRS.has(entry)) {
+            this._scanWhyJsonFiles(fullPath, items);
+          }
+        } else if (entry.endsWith("_why.json")) {
+          // 対応するソースファイルパスを推定
+          const srcPath = fullPath.replace(/_why\.json$/, "");
+          const label   = path.relative(
+            vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "",
+            fullPath
+          );
+          items.push(new WhyTreeItem(
+            label,
+            "file",
+            vscode.TreeItemCollapsibleState.Collapsed,
+            srcPath,
+          ));
+        }
+      } catch { /* skip */ }
+    }
+  }
+
+  private _getEntryNodes(sourceFilePath: string): WhyTreeItem[] {
+    const entries = _loadWhyCache(sourceFilePath);
+    return entries.map((e) => {
+      const firstLine = e.why.split("\n")[0].trim();
+      const label     = firstLine.length > 50 ? firstLine.slice(0, 50) + "…" : firstLine;
+      return new WhyTreeItem(
+        `[${e.name}] ${label}`,
+        "entry",
+        vscode.TreeItemCollapsibleState.None,
+        sourceFilePath,
+        e.why,
+        e.name,
+      );
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

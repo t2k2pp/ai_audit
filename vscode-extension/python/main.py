@@ -181,6 +181,12 @@ def cmd_search_why(args: argparse.Namespace) -> None:
     print_search_results(results)
 
 
+def cmd_list_why(_args: argparse.Namespace) -> None:
+    from ai_audit.usecase_b import list_why, print_list_results
+    results = list_why()
+    print_list_results(results)
+
+
 def cmd_review_architecture(args: argparse.Namespace) -> None:
     from ai_audit.config_manager import validate_env
     validate_env()
@@ -313,6 +319,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("query", help="検索クエリ（自然言語）")
     p_search.add_argument("--top-k", type=int, default=5, help="返す結果の最大件数（デフォルト: 5）")
     p_search.set_defaults(func=cmd_search_why)
+
+    # --- list_why ---
+    p_list = subparsers.add_parser(
+        "list_why",
+        help="ユースケースB: 蓄積済み設計思想の一覧を表示する",
+    )
+    p_list.set_defaults(func=cmd_list_why)
 
     # --- review_architecture ---
     p_review = subparsers.add_parser(
