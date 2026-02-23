@@ -3,7 +3,7 @@
   "publisher": "ai-audit-internal",
   "displayName": "ai_audit - AI Code Auditor",
   "description": "ファイル保存時に自動でAI多重マイクロ監査を実行し、問題箇所を波線とホバーで表示する",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Linters"],
   "activationEvents": ["onStartupFinished"],

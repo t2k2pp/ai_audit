@@ -35,7 +35,7 @@ $VenvPy  = Join-Path $VenvDir "Scripts\python.exe"
 $VenvPip = Join-Path $VenvDir "Scripts\pip.exe"
 
 Write-Host "[2/6] Installing dependencies into venv..."
-& $VenvPip install --quiet requests python-dotenv pyinstaller tree-sitter tree-sitter-javascript tree-sitter-typescript
+& $VenvPip install --quiet requests python-dotenv pyinstaller tree-sitter tree-sitter-javascript tree-sitter-typescript tree-sitter-language-pack
 if ($LASTEXITCODE -ne 0) { Write-Error "pip install failed"; exit 1 }
 
 Write-Host "[3/6] Building with PyInstaller (isolated)..."

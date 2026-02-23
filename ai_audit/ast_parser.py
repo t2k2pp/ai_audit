@@ -1,5 +1,5 @@
 """
-ASTパーサー: Python / JavaScript / TypeScript ソースコードを関数・クラス単位にチャンク化する
+ASTパーサー: Python / JavaScript / TypeScript / Dart ソースコードを関数・クラス単位にチャンク化する
 """
 import ast
 import os
@@ -7,6 +7,8 @@ from typing import Generator
 
 # JS/TS 拡張子セット
 _JS_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx"}
+# Dart 拡張子セット
+_DART_EXTENSIONS = {".dart"}
 # 除外ディレクトリ
 _EXCLUDE_DIRS = {"__pycache__", ".venv", "venv", ".git", "node_modules", "dist", "build", ".next"}
 
@@ -18,10 +20,10 @@ _EXCLUDE_DIRS = {"__pycache__", ".venv", "venv", ".git", "node_modules", "dist",
 def parse_chunks(file_path: str) -> list[dict]:
     """
     ソースファイルを解析し、関数・クラス単位のチャンクリストを返す。
-    拡張子に応じて Python または JS/TS パーサーを自動選択する。
+    拡張子に応じて Python / JS/TS / Dart パーサーを自動選択する。
 
     Args:
-        file_path: 解析対象ファイルパス（.py / .js / .ts / .jsx / .tsx）
+        file_path: 解析対象ファイルパス（.py / .js / .ts / .jsx / .tsx / .dart）
 
     Returns:
         チャンクの辞書リスト。各辞書は以下のキーを持つ:
@@ -30,18 +32,20 @@ def parse_chunks(file_path: str) -> list[dict]:
           - type: str      "function" または "class"
           - code: str      ソースコード文字列
           - lineno: int    開始行番号
-          - lang: str      "python" / "javascript" / "typescript"
+          - lang: str      "python" / "javascript" / "typescript" / "dart"
     """
     ext = os.path.splitext(file_path)[1].lower()
     if ext in _JS_EXTENSIONS:
         return parse_chunks_js(file_path)
+    if ext in _DART_EXTENSIONS:
+        return parse_chunks_dart(file_path)
     return _parse_chunks_python(file_path)
 
 
 def generate_skeleton(file_path: str) -> str:
     """
     ソースファイルのスケルトンコードを生成する。
-    拡張子に応じて Python または JS/TS スケルトナーを自動選択する。
+    拡張子に応じて Python / JS/TS / Dart スケルトナーを自動選択する。
 
     Args:
         file_path: 対象ファイルパス
@@ -53,6 +57,8 @@ def generate_skeleton(file_path: str) -> str:
     ext = os.path.splitext(file_path)[1].lower()
     if ext in _JS_EXTENSIONS:
         return generate_skeleton_js(file_path)
+    if ext in _DART_EXTENSIONS:
+        return generate_skeleton_dart(file_path)
     return _generate_skeleton_python(file_path)
 
 
@@ -94,20 +100,20 @@ def scan_js_files(directory: str) -> Generator[str, None, None]:
 
 def scan_source_files(directory: str) -> Generator[str, None, None]:
     """
-    ディレクトリを再帰スキャンしてPython・JS/TSファイルのパスを返す。
+    ディレクトリを再帰スキャンしてPython・JS/TS・Dartファイルのパスを返す。
 
     Args:
         directory: スキャン対象ディレクトリ
 
     Yields:
-        ソースファイルの絶対パス（.py / .js / .jsx / .ts / .tsx）
+        ソースファイルの絶対パス（.py / .js / .jsx / .ts / .tsx / .dart）
     """
     abs_dir = os.path.abspath(directory)
     for root, dirs, files in os.walk(abs_dir):
         dirs[:] = [d for d in dirs if d not in _EXCLUDE_DIRS]
         for filename in files:
             ext = os.path.splitext(filename)[1].lower()
-            if ext == ".py" or ext in _JS_EXTENSIONS:
+            if ext == ".py" or ext in _JS_EXTENSIONS or ext in _DART_EXTENSIONS:
                 yield os.path.join(root, filename)
 
 
@@ -118,6 +124,8 @@ def get_lang(file_path: str) -> str:
         return "typescript"
     if ext in (".js", ".jsx"):
         return "javascript"
+    if ext == ".dart":
+        return "dart"
     return "python"
 
 
@@ -502,3 +510,158 @@ def _replace_block_with_stub(block_node, skeleton_lines: list[str]) -> None:
     stripped = end_line.lstrip()
     indent = end_line[: len(end_line) - len(stripped)]
     skeleton_lines[end_row] = indent + "}\n"
+
+
+# ---------------------------------------------------------------------------
+# Dart パーサー（tree-sitter-language-pack）
+# ---------------------------------------------------------------------------
+
+def _get_dart_parser():
+    """
+    tree-sitter-language-pack から Dart パーサーを返す。
+    未インストールの場合は None を返す。
+    """
+    try:
+        from tree_sitter_language_pack import get_parser
+        return get_parser("dart")
+    except (ImportError, Exception):
+        return None
+
+
+def parse_chunks_dart(file_path: str) -> list[dict]:
+    """
+    Dartファイルを解析し、クラス・トップレベル関数単位のチャンクリストを返す。
+
+    Args:
+        file_path: 解析対象の Dart ファイルパス
+
+    Returns:
+        チャンクの辞書リスト（parse_chunks と同形式）
+    """
+    abs_path = os.path.abspath(file_path)
+    parser = _get_dart_parser()
+    if parser is None:
+        return []
+
+    try:
+        with open(abs_path, "r", encoding="utf-8") as f:
+            source = f.read()
+    except UnicodeDecodeError:
+        with open(abs_path, "r", encoding="latin-1") as f:
+            source = f.read()
+
+    source_bytes = source.encode("utf-8")
+    tree = parser.parse(source_bytes)
+    source_lines = source.splitlines(keepends=True)
+
+    chunks = []
+    _collect_dart_chunks(tree.root_node, source_bytes, source_lines, abs_path, chunks)
+    chunks.sort(key=lambda c: c["lineno"])
+    return chunks
+
+
+def _collect_dart_chunks(node, source_bytes, source_lines, abs_path, chunks):
+    """
+    Dart ASTのルートノードを走査してチャンクを収集する。
+    - class_definition: クラス全体
+    - function_signature + function_body ペア: トップレベル関数
+    """
+    if node.type != "program":
+        return
+
+    children = list(node.children)
+    i = 0
+    while i < len(children):
+        child = children[i]
+
+        # クラス定義
+        if child.type == "class_definition":
+            name = _get_dart_identifier(child, source_bytes)
+            if name:
+                code = _node_source(child, source_lines)
+                chunks.append(_make_js_chunk(abs_path, name, "class", code, child.start_point.row + 1, "dart"))
+            i += 1
+
+        # トップレベル関数: function_signature の直後に function_body が来る
+        elif child.type == "function_signature":
+            name = _get_dart_function_name(child, source_bytes)
+            if name and i + 1 < len(children) and children[i + 1].type == "function_body":
+                func_node = children[i + 1]
+                # function_signature から function_body までをまとめてコードとして取得
+                start_row = child.start_point.row
+                end_row = func_node.end_point.row + 1
+                code = "".join(source_lines[start_row:end_row])
+                chunks.append(_make_js_chunk(abs_path, name, "function", code, start_row + 1, "dart"))
+                i += 2  # function_signature と function_body を両方消費
+            else:
+                i += 1
+
+        else:
+            i += 1
+
+
+def _get_dart_identifier(node, source_bytes: bytes) -> str:
+    """class_definition ノードから識別子（クラス名）を返す。"""
+    for child in node.children:
+        if child.type == "identifier":
+            return source_bytes[child.start_byte:child.end_byte].decode("utf-8")
+    return ""
+
+
+def _get_dart_function_name(node, source_bytes: bytes) -> str:
+    """
+    function_signature ノードから関数名を返す。
+    function_signature の子に identifier が含まれる（戻り値型の後）。
+    """
+    for child in node.children:
+        if child.type == "identifier":
+            return source_bytes[child.start_byte:child.end_byte].decode("utf-8")
+    return ""
+
+
+def generate_skeleton_dart(file_path: str) -> str:
+    """
+    Dartファイルのスケルトンコードを生成する。
+    function_body の block を「{ /* ... */ }」に置き換える。
+
+    Args:
+        file_path: 対象 Dart ファイルパス
+
+    Returns:
+        スケルトンコード文字列
+        パースエラーまたは未インストールの場合は空文字列
+    """
+    abs_path = os.path.abspath(file_path)
+    parser = _get_dart_parser()
+    if parser is None:
+        return ""
+
+    try:
+        with open(abs_path, "r", encoding="utf-8") as f:
+            source = f.read()
+    except UnicodeDecodeError:
+        with open(abs_path, "r", encoding="latin-1") as f:
+            source = f.read()
+
+    source_bytes = source.encode("utf-8")
+    tree = parser.parse(source_bytes)
+    source_lines = source.splitlines(keepends=True)
+
+    skeleton_lines = list(source_lines)
+    _strip_dart_function_bodies(tree.root_node, source_bytes, skeleton_lines)
+
+    return "".join(skeleton_lines)
+
+
+def _strip_dart_function_bodies(node, source_bytes: bytes, skeleton_lines: list[str]) -> None:
+    """
+    Dart ASTを再帰走査し、function_body 内の block を「{ /* ... */ }」に置き換える。
+    """
+    if node.type == "function_body":
+        for child in node.children:
+            if child.type == "block":
+                _replace_block_with_stub(child, skeleton_lines)
+                return  # 内部は処理しない
+
+    for child in node.children:
+        _strip_dart_function_bodies(child, source_bytes, skeleton_lines)
