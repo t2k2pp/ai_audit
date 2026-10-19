@@ -36,9 +36,7 @@ Thumbs.db
 coverage/
 .nyc_output/
 
-# Steering files (task management - temporary)
-.steering/*
-!.steering/.gitkeep
+# Steering files: 作業計画は再開用に Git 管理する
 
 # Lock files (keep package-lock.json for consistency)
 # yarn.lock
@@ -61,12 +59,16 @@ chroma_data/
 *_audit.json
 _summary_audit.json
 _architecture.md
-_why.json
+*_why.json
+_design/.ai_audit/
 
 # VSCode拡張 - ビルド成果物
 vscode-extension/out/
 vscode-extension/build_tmp/
 vscode-extension/*.vsix
+
+# VSCode拡張 - 同梱 Python（ビルド時に ai_audit/ と main.py をコピー）
+vscode-extension/python/
 
 # VSCode拡張 - バイナリ（OS別ビルドが必要なため除外）
 vscode-extension/bin/
