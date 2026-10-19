@@ -176,20 +176,31 @@ def cmd_audit(args: argparse.Namespace) -> None:
 
 
 def cmd_extract_why(args: argparse.Namespace) -> None:
-    _validated_settings()
-    from ai_audit.usecase_b import extract_why
-    extract_why(args.directory, force=args.force)
+    if not os.path.isdir(args.directory):
+        _fail(f"ディレクトリが見つかりません: {args.directory}")
+    rt = _runtime()
+    from ai_audit.usecases.why import extract_why
+    extract_why(args.directory, force=args.force, runtime=rt)
 
 
 def cmd_search_why(args: argparse.Namespace) -> None:
-    _validated_settings()
-    from ai_audit.usecase_b import print_search_results, search_why
-    print_search_results(search_why(args.query, top_k=args.top_k))
+    from ai_audit.core.config import load_env, load_settings
+    from ai_audit.usecases.why import print_search_results, search_why
+    load_env()
+    results = search_why(args.query, directory=args.dir, top_k=args.top_k, settings=load_settings())
+    if args.json:
+        print(json.dumps(results, ensure_ascii=False, indent=1))
+    else:
+        print_search_results(results)
 
 
-def cmd_list_why(_args: argparse.Namespace) -> None:
-    from ai_audit.usecase_b import list_why, print_list_results
-    print_list_results(list_why())
+def cmd_list_why(args: argparse.Namespace) -> None:
+    from ai_audit.usecases.why import list_why, print_list_results
+    results = list_why(args.dir)
+    if args.json:
+        print(json.dumps(results, ensure_ascii=False, indent=1))
+    else:
+        print_list_results(results)
 
 
 def cmd_review_architecture(args: argparse.Namespace) -> None:
@@ -287,10 +298,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("search_why", help="蓄積した設計思想を自然言語で検索する")
     p.add_argument("query", help="検索クエリ")
+    p.add_argument("--dir", default=".", help="抽出済みのプロジェクトディレクトリ（既定: カレント）")
     p.add_argument("--top-k", type=int, default=5, help="最大件数（既定: 5）")
+    p.add_argument("--json", action="store_true", help="JSON で出力する")
     p.set_defaults(func=cmd_search_why)
 
     p = sub.add_parser("list_why", help="蓄積済み設計思想の一覧を表示する")
+    p.add_argument("--dir", default=".", help="抽出済みのプロジェクトディレクトリ（既定: カレント）")
+    p.add_argument("--json", action="store_true", help="JSON で出力する")
     p.set_defaults(func=cmd_list_why)
 
     p = sub.add_parser("review_architecture", help="アーキテクチャをレビューする")

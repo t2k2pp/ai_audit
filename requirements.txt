@@ -1,8 +1,5 @@
-# ai_audit 依存パッケージ
-# Python 3.10 以上
+# ai_audit 依存パッケージ（Python 3.10 以上）
 #
 # インストール: pip install -r requirements.txt
+# v0.4 で ChromaDB 依存を廃止（設計思想はプロジェクト内の SQLite に保存）
 -r requirements-core.txt
-
-# ベクトルDB（設計思想の蓄積・検索）
-chromadb==1.5.1
