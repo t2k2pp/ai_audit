@@ -2,10 +2,12 @@
 
 ## 技術スタック
 
-- 開発環境: devcontainer
-- Node.js v24.11.0
-- TypeScript 5.x
-- パッケージマネージャー: npm
+- 開発環境: devcontainer（`.devcontainer/`）
+- コア（CLI / 解析エンジン）: Python 3.13（`ai_audit/`, `main.py`）
+  - 依存: `requirements.txt`、開発用: `requirements-dev.txt`
+  - テスト: `pytest`（`tests/`、LLM はダミーサーバで代替）
+- VSCode 拡張: TypeScript 5.x / Node.js（`vscode-extension/`、パッケージマネージャー: npm）
+  - 同梱 Python はビルド時に `ai_audit/` と `main.py` をコピーする（直接編集しない）
 
 ## スペック駆動開発の基本原則
 
@@ -70,7 +72,11 @@
 - 自由形式（構造化は最小限）
 - `/setup-project`実行時に自動的に読み込まれる
 
-#### 正式版ドキュメント
+#### 本プロジェクトの設計書
+- `docs/1.`〜`docs/5.`: v0.3 までの設計書・ロードマップ
+- `docs/6. 詳細設計書_v0.4_大コンテキスト対応.md`: v0.4 の正式設計
+
+#### 正式版ドキュメント（テンプレート標準。未作成）
 - **product-requirements.md** - プロダクト要求定義書
 - **functional-design.md** - 機能設計書
 - **architecture.md** - 技術仕様書
