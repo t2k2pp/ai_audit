@@ -1,5 +1,5 @@
 /**
- * ai_audit VSCode 拡張機能 (Phase 1)
+ * ai_audit VSCode 拡張機能 (v0.4)
  *
  * 利用者の動線:
  *   1. VSIXをVSCodeにインストール
@@ -26,12 +26,21 @@ const SUPPORTED_LANGUAGES: Array<{
   status: "supported" | "planned";
   since: string;
 }> = [
-  { id: "python",     label: "Python",     status: "supported", since: "v0.1.0" },
-  { id: "javascript", label: "JavaScript", status: "supported", since: "v0.3.0" },
-  { id: "typescript", label: "TypeScript", status: "supported", since: "v0.3.0" },
+  { id: "python",          label: "Python",           status: "supported", since: "v0.1.0" },
+  { id: "javascript",      label: "JavaScript",       status: "supported", since: "v0.3.0" },
+  { id: "javascriptreact", label: "JavaScript (JSX)", status: "supported", since: "v0.3.0" },
+  { id: "typescript",      label: "TypeScript",       status: "supported", since: "v0.3.0" },
+  { id: "typescriptreact", label: "TypeScript (TSX)", status: "supported", since: "v0.3.0" },
+  { id: "dart",            label: "Dart",             status: "supported", since: "v0.3.1" },
   { id: "go",         label: "Go",         status: "planned",   since: "-" },
   { id: "csharp",     label: "C#",         status: "planned",   since: "-" },
 ];
+
+/** 拡張子 → 言語 ID（エクスプローラーから呼ばれた場合の判定用） */
+const EXT_TO_LANG: Record<string, string> = {
+  ".py": "python", ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+  ".jsx": "javascriptreact", ".ts": "typescript", ".tsx": "typescriptreact", ".dart": "dart",
+};
 
 // ---------------------------------------------------------------------------
 // グローバル状態
@@ -85,7 +94,7 @@ export function activate(context: vscode.ExtensionContext) {
       const filePath = uri?.fsPath ?? vscode.window.activeTextEditor?.document.uri.fsPath;
       if (!filePath) { return; }
       const langId = uri
-        ? (filePath.endsWith(".py") ? "python" : "")
+        ? (EXT_TO_LANG[path.extname(filePath).toLowerCase()] ?? "")
         : (vscode.window.activeTextEditor?.document.languageId ?? "");
       const supported = SUPPORTED_LANGUAGES.find(
         (l) => l.id === langId && l.status === "supported"
@@ -228,7 +237,9 @@ export function activate(context: vscode.ExtensionContext) {
         placeHolder: "検索キーワード",
       });
       if (!query) { return; }
-      runBackendCommand("search_why", [query], "searchWhy");
+      const root = await pickWhyRoot();
+      if (!root) { return; }
+      runBackendCommand("search_why", [query, "--dir", root], "searchWhy");
     })
   );
 
@@ -359,7 +370,9 @@ export function activate(context: vscode.ExtensionContext) {
         if (action === "セットアップする") { await setupWhyFeature(); }
         return;
       }
-      runBackendCommand("list_why", [], "listWhy");
+      const root = await pickWhyRoot();
+      if (!root) { return; }
+      runBackendCommand("list_why", ["--dir", root], "listWhy");
     })
   );
 
@@ -633,17 +646,11 @@ function resolveBackendBinary(): string | null {
 // ---------------------------------------------------------------------------
 // 監査実行
 // ---------------------------------------------------------------------------
-function runAudit(filePath: string, force: boolean): void {
-  if (runningAudits.has(filePath)) { return; }
-  runningAudits.add(filePath);
-
-  const cfg          = vscode.workspace.getConfiguration("aiAudit");
-  const apiUrl       = cfg.get<string>("apiBaseUrl", "").trim();
-  const apiKey       = cfg.get<string>("apiKey", "").trim();
-  const modelName    = cfg.get<string>("modelName", "").trim();
-  const maxTokens    = cfg.get<number | null>("maxOutputTokens", null);
-
-  // 必須設定チェック（apiKey は任意）
+/** VSCode 設定をバックエンドの環境変数に変換する（.env 不要）。必須設定がなければ null。 */
+function buildBackendEnv(): NodeJS.ProcessEnv | null {
+  const cfg = vscode.workspace.getConfiguration("aiAudit");
+  const apiUrl    = cfg.get<string>("apiBaseUrl", "").trim();
+  const modelName = cfg.get<string>("modelName", "").trim();
   const missing: string[] = [];
   if (!apiUrl)    { missing.push("API URL"); }
   if (!modelName) { missing.push("モデル名"); }
@@ -651,72 +658,88 @@ function runAudit(filePath: string, force: boolean): void {
     vscode.window.showErrorMessage(
       `ai_audit: 設定が不足しています。コマンドパレットから "ai_audit: 接続設定を開く" を実行して設定してください。\n未入力: ${missing.join(", ")}`
     );
-    runningAudits.delete(filePath);
-    return;
+    return null;
   }
-
-  // 拡張機能に同梱されたバイナリのパスを解決
-  const binaryPath = resolveBackendBinary();
-
-  if (!binaryPath || !fs.existsSync(binaryPath)) {
-    vscode.window.showErrorMessage(
-      `ai_audit: バイナリが見つかりません（${binaryPath}）。\n` +
-      `お使いのOSに対応した VSIX を再インストールしてください。`
-    );
-    runningAudits.delete(filePath);
-    return;
-  }
-
-  const args = ["audit", filePath];
-  if (force) { args.push("--force"); }
-
-  // VSCode 設定を環境変数として渡す（.env が不要になる）
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     PYTHONUTF8: "1",          // Windows CP932 環境での文字化け防止
     LLM_API_BASE_URL: apiUrl,
     LLM_MODEL_NAME:   modelName,
   };
-  // apiKey は任意（空の場合は環境変数を設定しない）
-  if (apiKey) { env["LLM_API_KEY"] = apiKey; }
-  if (maxTokens !== null && maxTokens !== undefined) {
-    env["LLM_MAX_OUTPUT_TOKENS"] = String(maxTokens);
+  const str = (key: string) => cfg.get<string>(key, "").trim();
+  const num = (key: string) => cfg.get<number | null>(key, null);
+  const setIf = (name: string, value: string | number | null | undefined) => {
+    if (value !== null && value !== undefined && value !== "") { env[name] = String(value); }
+  };
+  setIf("LLM_API_KEY", str("apiKey"));
+  setIf("LLM_MAX_OUTPUT_TOKENS", num("maxOutputTokens"));
+  setIf("LLM_CONTEXT_LENGTH", num("contextLength"));
+  setIf("LLM_CONTEXT_BUDGET", num("contextBudget"));
+  const tier = str("tier");
+  setIf("AI_AUDIT_TIER", tier === "auto" ? "" : tier);
+  setIf("LLM_REASONING", str("reasoning"));
+  setIf("LLM_EXTRA_BODY", str("extraBody"));
+  setIf("LLM_PARALLEL", num("parallel"));
+  setIf("LLM_EMBEDDING_MODEL", str("embeddingModel"));
+  setIf("LLM_SERVER_TYPE", str("serverType"));
+  return env;
+}
+
+/** 同梱バイナリのパス（存在しなければエラー表示して null）。 */
+function requireBackendBinary(): string | null {
+  const binaryPath = resolveBackendBinary();
+  if (!binaryPath || !fs.existsSync(binaryPath)) {
+    vscode.window.showErrorMessage(
+      `ai_audit: バイナリが見つかりません（${binaryPath}）。\n` +
+      `お使いのOSに対応した VSIX を再インストールしてください。`
+    );
+    return null;
   }
+  return binaryPath;
+}
+
+/** ソースファイルに対応する監査結果 JSON のパス（拡張子を _audit.json に置換）。 */
+function auditJsonPathFor(filePath: string): string {
+  return filePath.replace(/\.[^./\\]+$/, "") + "_audit.json";
+}
+
+function runAudit(filePath: string, force: boolean): void {
+  if (runningAudits.has(filePath)) { return; }
+  const env = buildBackendEnv();
+  const binaryPath = env ? requireBackendBinary() : null;
+  if (!env || !binaryPath) { return; }
+  runningAudits.add(filePath);
+
+  const args = ["audit", filePath];
+  if (force) { args.push("--force"); }
 
   const shortName = path.basename(filePath);
   statusBarItem.text = `$(sync~spin) ai_audit: ${shortName} を監査中...`;
 
-  const proc = cp.spawn(binaryPath, args, {
-    cwd: path.dirname(binaryPath),
-    env,
-  });
-
+  const proc = cp.spawn(binaryPath, args, { cwd: path.dirname(binaryPath), env });
   const stderrChunks: Buffer[] = [];
   proc.stderr.on("data", (data: Buffer) => { stderrChunks.push(data); });
+  proc.on("error", (err) => {
+    runningAudits.delete(filePath);
+    statusBarItem.text = "$(shield) ai_audit";
+    vscode.window.showErrorMessage(`ai_audit: 起動エラー: ${err.message}`);
+  });
 
   proc.on("close", (code) => {
     runningAudits.delete(filePath);
     statusBarItem.text = "$(shield) ai_audit";
-
     if (code !== 0) {
-      const stderr = decodeBuffer(stderrChunks);
-      vscode.window.showErrorMessage(
-        `ai_audit エラー: ${stderr.slice(0, 300)}`
-      );
+      vscode.window.showErrorMessage(`ai_audit エラー: ${decodeBuffer(stderrChunks).slice(-300)}`);
       return;
     }
-
-    const auditJsonPath = filePath.replace(/\.py$/, "_audit.json");
+    const auditJsonPath = auditJsonPathFor(filePath);
     if (!fs.existsSync(auditJsonPath)) {
       diagnosticCollection.set(vscode.Uri.file(filePath), []);
       return;
     }
-
     try {
-      const raw = fs.readFileSync(auditJsonPath, "utf-8");
-      const auditResult = JSON.parse(raw);
+      const auditResult = JSON.parse(fs.readFileSync(auditJsonPath, "utf-8"));
       applyDiagnostics(filePath, auditResult);
-
       const total = auditResult.total_issues ?? 0;
       statusBarItem.text = total > 0
         ? `$(warning) ai_audit: ${total} 件の指摘`
@@ -731,64 +754,27 @@ function runAudit(filePath: string, force: boolean): void {
 // フォルダ一括監査
 // ---------------------------------------------------------------------------
 function runAuditFolder(folderPath: string): void {
-  const cfg       = vscode.workspace.getConfiguration("aiAudit");
-  const apiUrl    = cfg.get<string>("apiBaseUrl", "").trim();
-  const apiKey    = cfg.get<string>("apiKey", "").trim();
-  const modelName = cfg.get<string>("modelName", "").trim();
-  const maxTokens = cfg.get<number | null>("maxOutputTokens", null);
-
-  const missing: string[] = [];
-  if (!apiUrl)    { missing.push("API URL"); }
-  if (!modelName) { missing.push("モデル名"); }
-  if (missing.length > 0) {
-    vscode.window.showErrorMessage(
-      `ai_audit: 設定が不足しています。\n未入力: ${missing.join(", ")}`
-    );
-    return;
-  }
-
-  const binaryPath = resolveBackendBinary();
-  if (!binaryPath || !fs.existsSync(binaryPath)) {
-    vscode.window.showErrorMessage(
-      `ai_audit: バイナリが見つかりません（${binaryPath}）。\n` +
-      `お使いのOSに対応した VSIX を再インストールしてください。`
-    );
-    return;
-  }
-
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    PYTHONUTF8: "1",          // Windows CP932 環境での文字化け防止
-    LLM_API_BASE_URL: apiUrl,
-    LLM_MODEL_NAME:   modelName,
-  };
-  if (apiKey)    { env["LLM_API_KEY"]           = apiKey; }
-  if (maxTokens !== null && maxTokens !== undefined) {
-    env["LLM_MAX_OUTPUT_TOKENS"] = String(maxTokens);
-  }
+  const env = buildBackendEnv();
+  const binaryPath = env ? requireBackendBinary() : null;
+  if (!env || !binaryPath) { return; }
 
   const shortName = path.basename(folderPath);
   statusBarItem.text = `$(sync~spin) ai_audit: ${shortName}/ を一括監査中...`;
-
-  const proc = cp.spawn(binaryPath, ["audit", folderPath], {
-    cwd: path.dirname(binaryPath),
-    env,
-  });
-
+  const proc = cp.spawn(binaryPath, ["audit", folderPath], { cwd: path.dirname(binaryPath), env });
   const stderrChunks: Buffer[] = [];
   proc.stderr.on("data", (data: Buffer) => { stderrChunks.push(data); });
+  proc.stdout.on("data", (data: Buffer) => { updateProgressFromOutput(data, `${shortName}/ を監査中`); });
 
   proc.on("close", (code) => {
     statusBarItem.text = "$(shield) ai_audit";
     if (code !== 0) {
-      const stderr = decodeBuffer(stderrChunks);
-      vscode.window.showErrorMessage(`ai_audit エラー: ${stderr.slice(0, 300)}`);
+      vscode.window.showErrorMessage(`ai_audit エラー: ${decodeBuffer(stderrChunks).slice(-300)}`);
       return;
     }
-
     // フォルダ以下の _audit.json をすべて探して Diagnostics に反映する
     let totalIssues = 0;
     let fileCount = 0;
+    const SKIP = new Set(["node_modules", ".git", ".ai_audit", "_design", "__pycache__", ".venv", "venv"]);
     const applyAll = (dir: string) => {
       let entries: string[];
       try { entries = fs.readdirSync(dir); } catch { return; }
@@ -797,31 +783,39 @@ function runAuditFolder(folderPath: string): void {
         try {
           const stat = fs.statSync(fullPath);
           if (stat.isDirectory()) {
-            applyAll(fullPath);
-          } else if (entry.endsWith("_audit.json")) {
-            const pyFile = fullPath.replace(/_audit\.json$/, ".py");
-            try {
-              const raw = fs.readFileSync(fullPath, "utf-8");
-              const auditResult = JSON.parse(raw);
-              applyDiagnostics(pyFile, auditResult);
-              totalIssues += auditResult.total_issues ?? 0;
-              fileCount++;
-            } catch { /* 読み込み失敗はスキップ */ }
+            if (!SKIP.has(entry)) { applyAll(fullPath); }
+          } else if (entry.endsWith("_audit.json") && entry !== "_summary_audit.json") {
+            const auditResult = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
+            const srcFile = auditResult.source_file ?? fullPath.replace(/_audit\.json$/, ".py");
+            applyDiagnostics(srcFile, auditResult);
+            totalIssues += auditResult.total_issues ?? 0;
+            fileCount++;
           }
-        } catch { /* stat 失敗はスキップ */ }
+        } catch { /* 読み込み失敗はスキップ */ }
       }
     };
     applyAll(folderPath);
-
     statusBarItem.text = totalIssues > 0
       ? `$(warning) ai_audit: ${totalIssues} 件の指摘`
       : "$(pass) ai_audit: 問題なし";
-
     vscode.window.showInformationMessage(
       `ai_audit: ${shortName}/ の一括監査が完了しました。${fileCount} ファイル / ${totalIssues} 件の指摘`
     );
   });
 }
+
+/** バックエンドの進捗出力（[STAGE] / [n/m]）をステータスバーに反映する。 */
+function updateProgressFromOutput(data: Buffer, label: string): void {
+  const text = data.toString("utf-8");
+  const stage = [...text.matchAll(/\[STAGE\] ([^\n（]+)/g)].pop();
+  const prog  = [...text.matchAll(/\[(\d+)\/(\d+)\]/g)].pop();
+  if (stage) { lastStage = stage[1].trim(); }
+  if (prog || stage) {
+    const p = prog ? ` ${prog[1]}/${prog[2]}` : "";
+    statusBarItem.text = `$(sync~spin) ai_audit: ${label}${lastStage ? `（${lastStage}${p}）` : p}`;
+  }
+}
+let lastStage = "";
 
 // ---------------------------------------------------------------------------
 // Diagnostics 変換
@@ -834,17 +828,20 @@ function severityToDiagnosticSeverity(severity: string): vscode.DiagnosticSeveri
   }
 }
 
+interface AuditIssue {
+  type: string;
+  severity: string;
+  line?: number;                     // v0.4: ファイル内の絶対行番号（1 始まり）
+  line_number_offset?: number | null;
+  line_approximate?: boolean;
+  title?: string;
+  description: string;
+  suggestion: string;
+  confidence?: string;
+}
+
 function applyDiagnostics(filePath: string, auditResult: {
-  chunks: Array<{
-    chunk_id: string;
-    issues: Array<{
-      type: string;
-      severity: string;
-      line_number_offset: number | null;
-      description: string;
-      suggestion: string;
-    }>;
-  }>;
+  chunks: Array<{ chunk_id: string; name?: string; start_line?: number; issues: AuditIssue[] }>;
 }): void {
   const cfg = vscode.workspace.getConfiguration("aiAudit");
   // 監査波線表示が OFF の場合は何もしない
@@ -861,31 +858,35 @@ function applyDiagnostics(filePath: string, auditResult: {
   } catch { /* フォールバック */ }
 
   for (const chunk of auditResult.chunks ?? []) {
-    const funcName = chunk.chunk_id.split(":").pop() ?? "";
-    let chunkStartLine = 0;
-    const defPattern = new RegExp(`^\\s*(def|class)\\s+${escapeRegex(funcName)}\\s*[:(]`);
-    for (let i = 0; i < fileLines.length; i++) {
-      if (defPattern.test(fileLines[i])) {
-        chunkStartLine = i;
-        break;
-      }
+    // v0.3 形式（line なし）の場合は定義行を探して offset を足す
+    let chunkStartLine = (chunk.start_line ?? 1) - 1;
+    if (chunk.start_line === undefined) {
+      const funcName = chunk.chunk_id.split(/[:.]/).pop() ?? "";
+      const defPattern = new RegExp(`^\\s*(def|class)\\s+${escapeRegex(funcName)}\\s*[:(]`);
+      const found = fileLines.findIndex((l) => defPattern.test(l));
+      chunkStartLine = found >= 0 ? found : 0;
     }
 
     for (const issue of chunk.issues ?? []) {
       const diagSeverity = severityToDiagnosticSeverity(issue.severity);
       if (!showInfo && diagSeverity === vscode.DiagnosticSeverity.Information) { continue; }
 
-      const targetLine = chunkStartLine + (issue.line_number_offset ?? 0);
-      const lineText   = fileLines[targetLine] ?? "";
-      const range      = new vscode.Range(targetLine, 0, targetLine, lineText.length || 1);
+      const targetLine = typeof issue.line === "number"
+        ? Math.max(0, issue.line - 1)
+        : chunkStartLine + (issue.line_number_offset ?? 0);
+      const lineText = fileLines[targetLine] ?? "";
+      const indent   = lineText.length - lineText.trimStart().length;
+      const range    = new vscode.Range(targetLine, indent, targetLine, Math.max(lineText.length, indent + 1));
 
+      const head = issue.title ? `${issue.title}: ` : "";
+      const note = issue.line_approximate ? "（行は推定）" : "";
+      const conf = issue.confidence === "low" ? "（確度: 低）" : "";
       const diag = new vscode.Diagnostic(
         range,
-        `[ai_audit/${issue.type}] ${issue.description}`,
+        `[ai_audit/${issue.type}] ${head}${issue.description}${note}${conf}`,
         diagSeverity
       );
       diag.source = "ai_audit";
-
       if (issue.suggestion) {
         diag.relatedInformation = [
           new vscode.DiagnosticRelatedInformation(
@@ -950,87 +951,27 @@ function runBackendCommand(
   args: string[],
   commandId: BackendCommandId
 ): void {
-  const cfg       = vscode.workspace.getConfiguration("aiAudit");
-  const apiUrl    = cfg.get<string>("apiBaseUrl", "").trim();
-  const apiKey    = cfg.get<string>("apiKey", "").trim();
-  const modelName = cfg.get<string>("modelName", "").trim();
-  const maxTokens = cfg.get<number | null>("maxOutputTokens", null);
-
-  const missing: string[] = [];
-  if (!apiUrl)    { missing.push("API URL"); }
-  if (!modelName) { missing.push("モデル名"); }
-  if (missing.length > 0) {
-    vscode.window.showErrorMessage(
-      `ai_audit: 設定が不足しています。\n未入力: ${missing.join(", ")}`
-    );
-    return;
-  }
-
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    PYTHONUTF8: "1",          // Windows CP932 環境での文字化け防止
-    LLM_API_BASE_URL: apiUrl,
-    LLM_MODEL_NAME:   modelName,
-  };
-  if (apiKey)    { env["LLM_API_KEY"]           = apiKey; }
-  if (maxTokens) { env["LLM_MAX_OUTPUT_TOKENS"] = String(maxTokens); }
+  // v0.4: 設計思想も含め、すべて同梱バイナリで実行する（ChromaDB 依存を廃止したため）
+  const env = buildBackendEnv();
+  const binaryPath = env ? requireBackendBinary() : null;
+  if (!env || !binaryPath) { return; }
 
   const label = BACKEND_COMMAND_LABELS[commandId];
   statusBarItem.text = `$(sync~spin) ai_audit: ${label}...`;
+  lastStage = "";
 
-  // extractWhy / searchWhy は chromadb が必要なため、
-  // バイナリ（PyInstaller）ではなく利用者環境の Python + 同梱 main.py で実行する
-  let spawnCmd: string;
-  let spawnArgs: string[];
-  let spawnCwd: string;
-
-  // extractWhy/searchWhy/listWhy のみ Python 直接実行（chromadb が必要なため）
-  // reviewArchitecture はバイナリで実行
-  const needsPython = commandId === "extractWhy" || commandId === "searchWhy" || commandId === "listWhy";
-  if (needsPython) {
-    const pythonPath = cfg.get<string>("pythonPath", "python").trim();
-    const mainPyPath = path.join(extensionPath, "python", "main.py");
-    spawnCmd  = pythonPath;
-    spawnArgs = [mainPyPath, subCommand, ...args];
-    spawnCwd  = path.join(extensionPath, "python");
-  } else {
-    const binaryPath = resolveBackendBinary();
-    if (!binaryPath || !fs.existsSync(binaryPath)) {
-      vscode.window.showErrorMessage(
-        `ai_audit: バイナリが見つかりません（${binaryPath}）。\n` +
-        `お使いのOSに対応した VSIX を再インストールしてください。`
-      );
-      return;
-    }
-    spawnCmd  = binaryPath;
-    spawnArgs = [subCommand, ...args];
-    spawnCwd  = path.dirname(binaryPath);
-  }
-
-  const proc = cp.spawn(spawnCmd, spawnArgs, {
-    cwd: spawnCwd,
-    env,
-    shell: needsPython, // Python はシェル経由で起動（PATH解決のため）
-  });
-
+  const proc = cp.spawn(binaryPath, [subCommand, ...args], { cwd: path.dirname(binaryPath), env });
   const stdoutChunks: Buffer[] = [];
   const stderrChunks: Buffer[] = [];
-  proc.stdout?.on("data", (data: Buffer) => { stdoutChunks.push(data); });
+  proc.stdout?.on("data", (data: Buffer) => {
+    stdoutChunks.push(data);
+    updateProgressFromOutput(data, label);
+  });
   proc.stderr.on("data",  (data: Buffer) => { stderrChunks.push(data); });
 
   proc.on("error", (err) => {
     statusBarItem.text = "$(shield) ai_audit";
-    if (needsPython) {
-      const pythonPath = cfg.get<string>("pythonPath", "python").trim();
-      vscode.window.showErrorMessage(
-        `ai_audit: Python の起動に失敗しました。\n` +
-        `パス: "${pythonPath}"\n` +
-        `エラー: ${err.message}\n\n` +
-        `設定画面の "Python パス" を確認してください。`
-      );
-    } else {
-      vscode.window.showErrorMessage(`ai_audit: 起動エラー: ${err.message}`);
-    }
+    vscode.window.showErrorMessage(`ai_audit: 起動エラー: ${err.message}`);
   });
 
   proc.on("close", (code) => {
@@ -1038,65 +979,69 @@ function runBackendCommand(
     const stdout = decodeBuffer(stdoutChunks);
     const stderr = decodeBuffer(stderrChunks);
 
-    if (code !== 0) {
-      vscode.window.showErrorMessage(`ai_audit エラー: ${stderr.slice(0, 300)}`);
+    // generate_design_doc は一部失敗時に終了コード 2（生成済みの部分は出力される）
+    if (code === 2 && commandId === "generateDesignDoc") {
+      vscode.window.showWarningMessage(
+        "ai_audit: 一部の生成に失敗しました。もう一度実行すると、失敗した部分だけを再生成します。"
+      );
+    } else if (code !== 0) {
+      vscode.window.showErrorMessage(`ai_audit エラー: ${stderr.slice(-300)}`);
       return;
     }
 
-    // 出力ファイルを読み込んで Webview に表示
     const title = BACKEND_COMMAND_TITLES[commandId];
     if (commandId === "extractWhy") {
-      const jsonPath = args[0].replace(/\.py$/, "_why.json");
-      showJsonResultInWebview(title, jsonPath);
-      // TreeView も更新
+      showWhyResultInWebview(title, args[0]);
       whyTreeProvider?.refresh();
       whyLensProvider?.refresh();
-    } else if (commandId === "searchWhy") {
-      // search-why は stdout に結果を出力する
-      showTextResultInWebview(title, stdout || stderr);
-    } else if (commandId === "listWhy") {
-      // list_why は stdout に結果を出力する
+    } else if (commandId === "searchWhy" || commandId === "listWhy") {
       showTextResultInWebview(title, stdout || stderr);
     } else if (commandId === "reviewArchitecture") {
-      // review-architecture は --output で指定したパスにファイルを書く
       // args = [folderPath, "--output", outputMdPath]
-      const mdPath = args[2] ?? path.join(args[0], "_architecture.md");
-      showMarkdownResultInWebview(title, mdPath);
+      openMarkdownPreview(args[2] ?? path.join(args[0], "_architecture.md"));
     } else if (commandId === "generateDesignDoc") {
-      // generate_design_doc は args[0] のフォルダ直下に両ファイルを書く
-      const folderPath = args[0];
-      const detailPath  = path.join(folderPath, "_design_detail.md");
-      const overviewPath = path.join(folderPath, "_design_overview.md");
-      showMarkdownResultInWebview("ai_audit: 詳細設計書", detailPath);
-      showMarkdownResultInWebview("ai_audit: 概要設計書", overviewPath);
+      const outDir = path.join(args[0], "_design");
+      openMarkdownPreview(path.join(outDir, "detail.md"));
+      openMarkdownPreview(path.join(outDir, "overview.md"));
+      vscode.window.showInformationMessage(
+        `ai_audit: 設計書を生成しました（${outDir}）。目次は README.md です。`
+      );
     }
   });
+}
+
+/** Markdown を VSCode 標準のプレビューで開く（Mermaid は対応拡張があれば描画される）。 */
+function openMarkdownPreview(mdPath: string): void {
+  if (!fs.existsSync(mdPath)) {
+    vscode.window.showWarningMessage(`ai_audit: 結果ファイルが見つかりません（${mdPath}）`);
+    return;
+  }
+  vscode.commands.executeCommand("markdown.showPreview", vscode.Uri.file(mdPath));
 }
 
 // ---------------------------------------------------------------------------
 // Webview 表示ヘルパー
 // ---------------------------------------------------------------------------
 
-function showJsonResultInWebview(title: string, jsonPath: string): void {
+function showWhyResultInWebview(title: string, rootDir: string): void {
+  const jsonPath = path.join(rootDir, ".ai_audit", "why.json");
   if (!fs.existsSync(jsonPath)) {
     vscode.window.showWarningMessage(`ai_audit: 結果ファイルが見つかりません（${jsonPath}）`);
     return;
   }
-
-  let data: Array<{ chunk_id: string; why: string }> = [];
+  let data: Record<string, WhyEntry[]> = {};
   try {
     data = JSON.parse(fs.readFileSync(jsonPath, "utf-8"));
   } catch {
     vscode.window.showErrorMessage(`ai_audit: 結果ファイルの読み込みに失敗しました（${jsonPath}）`);
     return;
   }
-
-  const rows = data.map((item) => `
+  const rows = Object.entries(data).flatMap(([file, entries]) => entries.map((item) => `
     <div class="card">
-      <div class="chunk-id">${escapeHtml(item.chunk_id)}</div>
+      <div class="chunk-id">${escapeHtml(file)}:${item.line} — ${escapeHtml(item.qualname)}</div>
       <div class="why">${escapeHtml(item.why ?? "").replace(/\n/g, "<br>")}</div>
     </div>
-  `).join("");
+  `)).join("");
 
   showWebview(title, `
     <style>
@@ -1121,38 +1066,6 @@ function showTextResultInWebview(title: string, text: string): void {
     </style>
     <h2>${escapeHtml(title)}</h2>
     <pre>${escapeHtml(text)}</pre>
-  `);
-}
-
-function showMarkdownResultInWebview(title: string, mdPath: string): void {
-  if (!fs.existsSync(mdPath)) {
-    vscode.window.showWarningMessage(`ai_audit: 結果ファイルが見つかりません（${mdPath}）`);
-    return;
-  }
-
-  const md = fs.readFileSync(mdPath, "utf-8");
-  // Markdown をシンプルな HTML に変換（見出し・コードブロック・箇条書きのみ）
-  const html = md
-    .replace(/^### (.+)$/gm, "<h3>$1</h3>")
-    .replace(/^## (.+)$/gm,  "<h2>$1</h2>")
-    .replace(/^# (.+)$/gm,   "<h1>$1</h1>")
-    .replace(/```[\s\S]*?```/g, (m) => `<pre><code>${escapeHtml(m.slice(3, -3).replace(/^\w*\n/, ""))}</code></pre>`)
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/^\* (.+)$/gm,  "<li>$1</li>")
-    .replace(/^- (.+)$/gm,   "<li>$1</li>")
-    .replace(/\n\n/g, "</p><p>")
-    .replace(/^(?!<[hlipc])(.+)$/gm, "<p>$1</p>");
-
-  showWebview(title, `
-    <style>
-      body { font-family: var(--vscode-font-family); padding: 16px; line-height: 1.6; }
-      h1,h2,h3 { color: var(--vscode-textLink-foreground); border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 4px; }
-      code { background: var(--vscode-textBlockQuote-background); padding: 2px 4px; border-radius: 3px; }
-      pre  { background: var(--vscode-textBlockQuote-background); padding: 12px; border-radius: 4px; overflow-x: auto; }
-      li   { margin-bottom: 4px; }
-    </style>
-    <h2>${escapeHtml(title)}</h2>
-    ${html}
   `);
 }
 
@@ -1214,96 +1127,84 @@ function buildPromptFromDiagnostic(diagnostic: vscode.Diagnostic): string {
 // 設計思想機能 セットアップウィザード
 // ---------------------------------------------------------------------------
 async function setupWhyFeature(): Promise<void> {
+  // v0.4 から追加インストールは不要（設計思想はプロジェクト内の SQLite に保存する）
   const cfg = vscode.workspace.getConfiguration("aiAudit");
-  const currentPythonPath = cfg.get<string>("pythonPath", "python");
-
-  // Step 1: Python パスを確認・入力
-  const pythonPath = await vscode.window.showInputBox({
-    title: "ai_audit: 設計思想機能のセットアップ",
-    prompt: "使用する Python のパスを確認してください。通常は変更不要です。",
-    value: currentPythonPath,
-    placeHolder: "python",
-    validateInput: (value) => {
-      if (!value.trim()) { return "Python のパスを入力してください。"; }
-      return null;
-    },
-  });
-  if (!pythonPath) { return; } // キャンセル
-
-  const pyCmd = pythonPath.trim();
-
-  // Python が動作するかチェック
-  statusBarItem.text = "$(sync~spin) ai_audit: Python を確認中...";
-  const pythonOk = await runPythonCheck(pyCmd, ["--version"]);
-  statusBarItem.text = "$(shield) ai_audit";
-
-  if (!pythonOk) {
-    const action = await vscode.window.showErrorMessage(
-      `ai_audit: Python が見つかりませんでした。\nパス: "${pyCmd}"\n\n` +
-      `Python がインストールされているか確認し、正しいパスを入力してください。`,
-      "設定を変更する",
-      "キャンセル"
-    );
-    if (action === "設定を変更する") {
-      vscode.commands.executeCommand("aiAudit.openSettings");
-    }
-    return;
-  }
-
-  // pythonPath 設定を保存
-  await cfg.update("pythonPath", pyCmd, vscode.ConfigurationTarget.Global);
-
-  // chromadb がすでにインストール済みか確認
-  statusBarItem.text = "$(sync~spin) ai_audit: chromadb を確認中...";
-  const chromaOk = await runPythonCheck(pyCmd, ["-c", "import chromadb"]);
-  statusBarItem.text = "$(shield) ai_audit";
-
-  if (chromaOk) {
-    // すでにインストール済み → 即有効化
-    await cfg.update("enableWhyFeature", true, vscode.ConfigurationTarget.Global);
-    vscode.window.showInformationMessage(
-      "ai_audit: chromadb は既にインストール済みです。設計思想機能を有効にしました。"
-    );
-    return;
-  }
-
-  // chromadb 未インストール → インストール確認
   const action = await vscode.window.showInformationMessage(
-    `chromadb がインストールされていません。\n` +
-    `インストールしますか？\n` +
-    `（実行コマンド: ${pyCmd} -m pip install chromadb）`,
-    "インストールする",
-    "キャンセル"
-  );
-  if (action !== "インストールする") { return; }
-
-  // VSCode ターミナルでインストール実行
-  const terminal = vscode.window.createTerminal("ai_audit: セットアップ");
-  terminal.show(true);
-  terminal.sendText(`${pyCmd} -m pip install chromadb`, true);
-
-  // インストール完了後に「有効にする」ボタンで確定
-  const done = await vscode.window.showInformationMessage(
-    `インストールが完了したら「有効にする」を押してください。`,
+    "ai_audit: 設計思想機能を有効にしますか？（追加のインストールは不要です。" +
+    "埋め込みモデルを設定すると検索精度が上がります）",
     "有効にする",
     "キャンセル"
   );
-  if (done === "有効にする") {
-    await cfg.update("enableWhyFeature", true, vscode.ConfigurationTarget.Global);
-    vscode.window.showInformationMessage(
-      "ai_audit: 設計思想機能を有効にしました。"
-    );
+  if (action !== "有効にする") { return; }
+  await cfg.update("enableWhyFeature", true, vscode.ConfigurationTarget.Global);
+  vscode.window.showInformationMessage(
+    "ai_audit: 設計思想機能を有効にしました。フォルダを右クリック →「設計思想を抽出」で開始します。"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 設計思想データ（<root>/.ai_audit/why.json）の読み込み
+// ---------------------------------------------------------------------------
+interface WhyEntry { id: string; name: string; qualname: string; kind: string; line: number; why: string; }
+
+/** ワークスペース内の why.json を持つディレクトリ（抽出済みのルート）を探す。 */
+function findWhyRoots(): string[] {
+  const roots: string[] = [];
+  const SKIP = new Set(["node_modules", ".git", ".ai_audit", "_design", "__pycache__", ".venv", "venv", "dist", "build"]);
+  const walk = (dir: string, depth: number) => {
+    if (fs.existsSync(path.join(dir, ".ai_audit", "why.json"))) { roots.push(dir); }
+    if (depth >= 3) { return; }
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.isDirectory() && !SKIP.has(e.name) && !e.name.startsWith(".")) {
+        walk(path.join(dir, e.name), depth + 1);
+      }
+    }
+  };
+  for (const folder of vscode.workspace.workspaceFolders ?? []) { walk(folder.uri.fsPath, 0); }
+  return roots;
+}
+
+async function pickWhyRoot(): Promise<string | undefined> {
+  const roots = findWhyRoots();
+  if (roots.length === 0) {
+    vscode.window.showWarningMessage("ai_audit: 抽出済みの設計思想がありません。先にフォルダを右クリック →「設計思想を抽出」を実行してください。");
+    return undefined;
+  }
+  if (roots.length === 1) { return roots[0]; }
+  return vscode.window.showQuickPick(roots, { title: "ai_audit: 対象のプロジェクトを選択" });
+}
+
+/** why.json の内容（ルート → {相対パス: エントリ}）のキャッシュ。 */
+const _whyRootCache = new Map<string, { mtime: number; data: Record<string, WhyEntry[]> }>();
+
+function _loadWhyRoot(root: string): Record<string, WhyEntry[]> {
+  const jsonPath = path.join(root, ".ai_audit", "why.json");
+  try {
+    const mtime = fs.statSync(jsonPath).mtimeMs;
+    const cached = _whyRootCache.get(root);
+    if (cached && cached.mtime === mtime) { return cached.data; }
+    const data = JSON.parse(fs.readFileSync(jsonPath, "utf-8"));
+    _whyRootCache.set(root, { mtime, data });
+    return data;
+  } catch {
+    return {};
   }
 }
 
-/** Python コマンドを shell 経由で実行し、終了コード 0 なら true を返す */
-function runPythonCheck(pythonPath: string, args: string[]): Promise<boolean> {
-  return new Promise((resolve) => {
-    const proc = cp.spawn(pythonPath, args, { shell: true });
-    proc.on("close", (code) => resolve(code === 0));
-    proc.on("error", () => resolve(false));
-    setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } resolve(false); }, 8000);
-  });
+/** ソースファイルの設計思想エントリ（最も近い祖先の why.json から読む）。 */
+function _loadWhyEntries(sourceFilePath: string): WhyEntry[] {
+  let dir = path.dirname(sourceFilePath);
+  for (;;) {
+    if (fs.existsSync(path.join(dir, ".ai_audit", "why.json"))) {
+      const rel = path.relative(dir, sourceFilePath).split(path.sep).join("/");
+      return _loadWhyRoot(dir)[rel] ?? [];
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) { return []; }
+    dir = parent;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,38 +1212,12 @@ function runPythonCheck(pythonPath: string, args: string[]): Promise<boolean> {
 // 関数・クラスの定義行の上に「💡 設計思想: ...」を薄く表示する
 // ---------------------------------------------------------------------------
 
-/**
- * _why.json ファイルから設計思想エントリを読み込み、キャッシュする。
- * キャッシュキー: ファイルパス (without _why.json suffix)
- */
-const _whyCache = new Map<string, Array<{ name: string; why: string; lineno?: number }>>();
-
-function _loadWhyCache(sourceFilePath: string): Array<{ name: string; why: string; lineno?: number }> {
-  const whyJsonPath = sourceFilePath.replace(/\.(py|js|jsx|ts|tsx|dart)$/, "_why.json");
-  if (!fs.existsSync(whyJsonPath)) { return []; }
-  const cached = _whyCache.get(sourceFilePath);
-  if (cached) { return cached; }
-  try {
-    const data: Array<{ chunk_id: string; why: string }> = JSON.parse(
-      fs.readFileSync(whyJsonPath, "utf-8")
-    );
-    const entries = data.map((item) => ({
-      name: item.chunk_id.split(":").pop() ?? "",
-      why:  item.why ?? "",
-    }));
-    _whyCache.set(sourceFilePath, entries);
-    return entries;
-  } catch {
-    return [];
-  }
-}
-
 class AiAuditWhyLensProvider implements vscode.CodeLensProvider {
   private _onDidChangeCodeLenses = new vscode.EventEmitter<void>();
   readonly onDidChangeCodeLenses = this._onDidChangeCodeLenses.event;
 
   refresh(): void {
-    _whyCache.clear();
+    _whyRootCache.clear();
     this._onDidChangeCodeLenses.fire();
   }
 
@@ -1351,52 +1226,18 @@ class AiAuditWhyLensProvider implements vscode.CodeLensProvider {
     if (!cfg.get<boolean>("showWhyLens", false)) { return []; }
     if (!cfg.get<boolean>("enableWhyFeature", false)) { return []; }
 
-    const entries = _loadWhyCache(document.uri.fsPath);
-    if (entries.length === 0) { return []; }
-
-    const lenses: vscode.CodeLens[] = [];
-    const fileLines = document.getText().split("\n");
-
-    // 関数・クラス定義行を探す（Python: def/class, JS/TS: function/class/const ... =, Dart: class）
-    const DEF_PATTERN = /^\s*(def|async\s+def|class|function\s+|export\s+(default\s+)?(function|class)|const\s+\w+\s*=\s*(async\s+)?\(|[A-Za-z_]\w*\s+[A-Za-z_]\w*\s*\()/;
-
-    for (let lineIdx = 0; lineIdx < fileLines.length; lineIdx++) {
-      const line = fileLines[lineIdx];
-      const defMatch = DEF_PATTERN.exec(line);
-      if (!defMatch) { continue; }
-
-      // 行から関数/クラス名を抽出
-      let nameMatch: RegExpMatchArray | null = null;
-      // Python: def func_name / class ClassName
-      nameMatch = line.match(/(?:def|class)\s+([A-Za-z_]\w*)/);
-      if (!nameMatch) {
-        // JS/TS: function funcName / class ClassName
-        nameMatch = line.match(/(?:function|class)\s+([A-Za-z_]\w*)/);
-      }
-      if (!nameMatch) {
-        // JS/TS: const funcName =
-        nameMatch = line.match(/const\s+([A-Za-z_]\w*)\s*=/);
-      }
-      if (!nameMatch) { continue; }
-
-      const funcName = nameMatch[1];
-      const entry = entries.find((e) => e.name === funcName);
-      if (!entry) { continue; }
-
-      // 1行目を抽出（最大60文字）
-      const firstLine = entry.why.split("\n")[0].trim();
-      const snippet   = firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine;
-
-      const range = new vscode.Range(lineIdx, 0, lineIdx, 0);
-      const lens  = new vscode.CodeLens(range, {
-        title:     `💡 設計思想: ${snippet}`,
-        command:   "aiAudit.showWhyDetail",
-        arguments: [entry.why, funcName],
+    // v0.4: why.json に定義行が記録されているので、その行に表示する
+    return _loadWhyEntries(document.uri.fsPath)
+      .filter((e) => e.line >= 1 && e.line <= document.lineCount)
+      .map((entry) => {
+        const firstLine = entry.why.split("\n")[0].trim();
+        const snippet   = firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine;
+        return new vscode.CodeLens(new vscode.Range(entry.line - 1, 0, entry.line - 1, 0), {
+          title:     `💡 設計思想: ${snippet}`,
+          command:   "aiAudit.showWhyDetail",
+          arguments: [entry.why, entry.qualname],
+        });
       });
-      lenses.push(lens);
-    }
-
-    return lenses;
   }
 }
 
@@ -1441,7 +1282,7 @@ class AiAuditWhyTreeProvider implements vscode.TreeDataProvider<WhyTreeItem> {
 
   /** ワークスペース内の _why.json ファイルを再スキャンして TreeView を更新 */
   refresh(): void {
-    _whyCache.clear();
+    _whyRootCache.clear();
     this._onDidChangeTreeData.fire();
   }
 
@@ -1464,59 +1305,33 @@ class AiAuditWhyTreeProvider implements vscode.TreeDataProvider<WhyTreeItem> {
   }
 
   private _getFileNodes(): WhyTreeItem[] {
-    const folders = vscode.workspace.workspaceFolders;
-    if (!folders || folders.length === 0) { return []; }
-
     const items: WhyTreeItem[] = [];
-    for (const folder of folders) {
-      this._scanWhyJsonFiles(folder.uri.fsPath, items);
+    const base = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
+    for (const root of findWhyRoots()) {
+      for (const rel of Object.keys(_loadWhyRoot(root)).sort()) {
+        const srcPath = path.join(root, rel);
+        items.push(new WhyTreeItem(
+          path.relative(base, srcPath) || rel,
+          "file",
+          vscode.TreeItemCollapsibleState.Collapsed,
+          srcPath,
+        ));
+      }
     }
     return items;
   }
 
-  private _scanWhyJsonFiles(dir: string, items: WhyTreeItem[]): void {
-    const SKIP_DIRS = new Set(["node_modules", ".git", "__pycache__", "build_tmp", "dist", ".venv", "venv"]);
-    let entries: string[];
-    try { entries = fs.readdirSync(dir); } catch { return; }
-
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry);
-      try {
-        const stat = fs.statSync(fullPath);
-        if (stat.isDirectory()) {
-          if (!SKIP_DIRS.has(entry)) {
-            this._scanWhyJsonFiles(fullPath, items);
-          }
-        } else if (entry.endsWith("_why.json")) {
-          // 対応するソースファイルパスを推定
-          const srcPath = fullPath.replace(/_why\.json$/, "");
-          const label   = path.relative(
-            vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "",
-            fullPath
-          );
-          items.push(new WhyTreeItem(
-            label,
-            "file",
-            vscode.TreeItemCollapsibleState.Collapsed,
-            srcPath,
-          ));
-        }
-      } catch { /* skip */ }
-    }
-  }
-
   private _getEntryNodes(sourceFilePath: string): WhyTreeItem[] {
-    const entries = _loadWhyCache(sourceFilePath);
-    return entries.map((e) => {
+    return _loadWhyEntries(sourceFilePath).map((e) => {
       const firstLine = e.why.split("\n")[0].trim();
       const label     = firstLine.length > 50 ? firstLine.slice(0, 50) + "…" : firstLine;
       return new WhyTreeItem(
-        `[${e.name}] ${label}`,
+        `[${e.qualname}] ${label}`,
         "entry",
         vscode.TreeItemCollapsibleState.None,
         sourceFilePath,
         e.why,
-        e.name,
+        e.qualname,
       );
     });
   }

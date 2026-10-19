@@ -2,11 +2,17 @@
   "name": "ai-audit",
   "publisher": "ai-audit-internal",
   "displayName": "ai_audit - AI Code Auditor",
-  "description": "ファイル保存時に自動でAI多重マイクロ監査を実行し、問題箇所を波線とホバーで表示する",
-  "version": "0.3.1",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Linters"],
-  "activationEvents": ["onStartupFinished"],
+  "description": "ローカル LLM によるコード監査・アーキテクチャ解析・設計書生成（4096 トークン環境から 256K 級まで対応）",
+  "version": "0.4.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Linters"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "configuration": {
@@ -28,9 +34,78 @@
           "markdownDescription": "**[必須]** 使用するモデル名（例: `gpt-oss:120b`）\n\n`ai_audit: モデル一覧を表示・切り替え` コマンドで一覧から選択できます"
         },
         "aiAudit.maxOutputTokens": {
-          "type": ["number", "null"],
+          "type": [
+            "number",
+            "null"
+          ],
           "default": null,
-          "markdownDescription": "最大出力トークン数（`null` = モデルのデフォルト最大値を使用）\n\n大きいほど詳細な指摘が得られますが、推論時間が増えます"
+          "markdownDescription": "最大出力トークン数（`null` = ティアに応じた既定値）"
+        },
+        "aiAudit.contextLength": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "markdownDescription": "最大コンテキスト長（`null` = サーバから自動取得）\n\nOllama では実行時のコンテキスト長がモデルの最大値より小さいことがあるため、実際の値の指定を推奨します。"
+        },
+        "aiAudit.contextBudget": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "markdownDescription": "1 リクエストで使うトークン数の上限（`null` = 自動。最大コンテキストの 50%、上限 128K）"
+        },
+        "aiAudit.tier": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "compact",
+            "standard",
+            "large"
+          ],
+          "default": "auto",
+          "markdownDescription": "機能ティア（`auto` = 実効予算から自動判定）\n\n- `compact`: 〜8K（4096 環境）\n- `standard`: 〜64K\n- `large`: 64K 超（ADR 生成・広い文脈）"
+        },
+        "aiAudit.reasoning": {
+          "type": "string",
+          "enum": [
+            "off",
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "off",
+          "markdownDescription": "思考モード（`off` 以外のとき `reasoning_effort` を送信。解釈はサーバ依存）"
+        },
+        "aiAudit.extraBody": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "リクエストに追加する JSON（サーバ固有パラメータ）\n\n例: `{\"chat_template_kwargs\": {\"enable_thinking\": false}}`"
+        },
+        "aiAudit.parallel": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "markdownDescription": "同時リクエスト数（推論サーバの並列数に合わせる）"
+        },
+        "aiAudit.embeddingModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "設計思想検索に使う埋め込みモデル名（空 = 語彙検索のみ）"
+        },
+        "aiAudit.serverType": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "llamacpp",
+            "vllm",
+            "ollama",
+            "openai"
+          ],
+          "default": "auto",
+          "markdownDescription": "推論サーバの種別（`auto` = 自動検出）"
         },
         "aiAudit.enableOnSave": {
           "type": "boolean",
@@ -45,12 +120,7 @@
         "aiAudit.enableWhyFeature": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "設計思想機能（抽出・検索）を有効にする\n\nPython と chromadb のインストールが必要です。\n初回は `ai_audit: 設計思想機能をセットアップ` コマンドで自動セットアップできます。"
-        },
-        "aiAudit.pythonPath": {
-          "type": "string",
-          "default": "python",
-          "markdownDescription": "設計思想機能で使用する Python のパス\n\n通常は `python` のままでOKです。"
+          "markdownDescription": "設計思想機能（抽出・検索・CodeLens）を有効にする\n\nv0.4 から追加のインストールは不要です（ChromaDB 依存を廃止）。"
         },
         "aiAudit.showWhyLens": {
           "type": "boolean",
@@ -95,7 +165,7 @@
       },
       {
         "command": "aiAudit.setupWhyFeature",
-        "title": "ai_audit: 設計思想機能をセットアップ"
+        "title": "ai_audit: 設計思想機能を有効にする"
       },
       {
         "command": "aiAudit.extractWhy",
@@ -111,7 +181,7 @@
       },
       {
         "command": "aiAudit.reviewArchitecture",
-        "title": "ai_audit: プロジェクト全体のアーキテクチャを解析"
+        "title": "ai_audit: アーキテクチャを解析する"
       },
       {
         "command": "aiAudit.generateDesignDoc",
@@ -147,12 +217,12 @@
       "editor/context": [
         {
           "command": "aiAudit.auditCurrentFile",
-          "when": "resourceLangId == python",
+          "when": "resourceExtname =~ /\\.(py|js|jsx|mjs|cjs|ts|tsx|dart)$/",
           "group": "ai_audit@1"
         },
         {
           "command": "aiAudit.auditCurrentFileForce",
-          "when": "resourceLangId == python",
+          "when": "resourceExtname =~ /\\.(py|js|jsx|mjs|cjs|ts|tsx|dart)$/",
           "group": "ai_audit@2"
         }
       ],
@@ -164,7 +234,7 @@
         },
         {
           "command": "aiAudit.auditCurrentFile",
-          "when": "resourceLangId == python",
+          "when": "resourceExtname =~ /\\.(py|js|jsx|mjs|cjs|ts|tsx|dart)$/",
           "group": "ai_audit@2"
         },
         {
