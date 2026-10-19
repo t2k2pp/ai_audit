@@ -5,7 +5,7 @@ from ai_audit.pipeline.jobstore import JobStore, stable_hash
 
 
 def test_step_reuse_and_force(tmp_path):
-    store = JobStore(str(tmp_path / "w"))
+    store = JobStore(str(tmp_path / "w"), "t")
     calls = []
 
     def work():
@@ -21,7 +21,7 @@ def test_step_reuse_and_force(tmp_path):
 
 
 def test_map_resumes_after_failure(tmp_path):
-    store = JobStore(str(tmp_path / "w"))
+    store = JobStore(str(tmp_path / "w"), "t")
     fail = {"b"}
     executed = []
 
@@ -45,6 +45,6 @@ def test_map_resumes_after_failure(tmp_path):
 
 def test_step_failed():
     import tempfile
-    p = Pipeline("t", JobStore(tempfile.mkdtemp()), quiet=True)
+    p = Pipeline("t", JobStore(tempfile.mkdtemp(), "t"), quiet=True)
     with pytest.raises(StepFailed):
         p.step("x", {}, lambda: 1 / 0)

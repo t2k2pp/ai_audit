@@ -1,9 +1,10 @@
 """
 ジョブストア: パイプラインの各ステップの成果物を入力ハッシュ付きで保存する
 
-保存先: <対象>/.ai_audit/work/<パイプライン名>/
+保存先: <対象>/.ai_audit/work/
   steps/<ステップ名を安全化したもの>.json  {"step", "input_hash", "saved_at", "data"}
-  job.json                                 直近ジョブの進捗（status コマンドで表示）
+                                           （全パイプラインで共有。設計書生成と構造解析で要約を再利用する）
+  <パイプライン名>/job.json                直近ジョブの進捗（status コマンドで表示）
 
 書き込みは一時ファイル → rename で行い、途中終了しても壊れたファイルを残さない。
 """
@@ -34,11 +35,16 @@ def atomic_write(path: str, text: str) -> None:
         raise
 
 
+def work_base(directory: str) -> str:
+    return os.path.join(os.path.abspath(directory), ".ai_audit", "work")
+
+
 class JobStore:
-    def __init__(self, work_dir: str):
-        self.work_dir = work_dir
-        self.steps_dir = os.path.join(work_dir, "steps")
+    def __init__(self, base_dir: str, name: str):
+        self.work_dir = os.path.join(base_dir, name)
+        self.steps_dir = os.path.join(base_dir, "steps")
         os.makedirs(self.steps_dir, exist_ok=True)
+        os.makedirs(self.work_dir, exist_ok=True)
 
     def _path(self, step: str) -> str:
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", step)[:80]

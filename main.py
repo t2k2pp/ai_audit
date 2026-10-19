@@ -191,9 +191,12 @@ def cmd_list_why(_args: argparse.Namespace) -> None:
 
 
 def cmd_review_architecture(args: argparse.Namespace) -> None:
-    _validated_settings()
-    from ai_audit.usecase_c import review_architecture
-    report = review_architecture(args.directory, output_file=args.output)
+    rt = _runtime(args.tier)
+    from ai_audit.usecases.architecture import review_architecture
+    if not os.path.isdir(args.directory):
+        _fail(f"ディレクトリが見つかりません: {args.directory}")
+    report = review_architecture(args.directory, output_file=args.output, force=args.force,
+                                 runtime=rt, lang=args.lang)
     if not args.output:
         print(report)
 
@@ -218,13 +221,15 @@ def cmd_generate_design_doc(args: argparse.Namespace) -> None:
 
 
 def cmd_status(args: argparse.Namespace) -> None:
-    from ai_audit.pipeline.jobstore import JobStore
-    base = os.path.join(os.path.abspath(args.directory), ".ai_audit", "work")
+    from ai_audit.pipeline.jobstore import JobStore, work_base
+    base = work_base(args.directory)
     if not os.path.isdir(base):
         print("ジョブの記録がありません。")
         return
     for name in sorted(os.listdir(base)):
-        st = JobStore(os.path.join(base, name)).read_status()
+        if name == "steps" or not os.path.isfile(os.path.join(base, name, "job.json")):
+            continue
+        st = JobStore(base, name).read_status()
         if not st:
             continue
         started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st["started_at"]))
@@ -284,6 +289,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("review_architecture", help="アーキテクチャをレビューする")
     p.add_argument("directory", help="対象ディレクトリ")
     p.add_argument("--output", default=None, help="結果を保存する Markdown ファイル")
+    p.add_argument("--force", action="store_true", help="保存済みの途中結果を使わず再実行する")
+    p.add_argument("--tier", choices=TIER_CHOICES, default=None, help="ティアを指定（既定: 自動判定）")
+    p.add_argument("--lang", choices=["ja", "en"], default="ja", help="出力言語（既定: ja）")
     p.set_defaults(func=cmd_review_architecture)
 
     p = sub.add_parser(

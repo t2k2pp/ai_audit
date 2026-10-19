@@ -15,7 +15,7 @@ from ...core.budget import TIER_LARGE
 from ...core.runtime import Runtime, create_runtime
 from ...index.gitinfo import is_git_repo
 from ...pipeline.engine import Pipeline, StepFailed
-from ...pipeline.jobstore import JobStore
+from ...pipeline.jobstore import JobStore, work_base
 from ...wears import design as W
 from .assemble import coverage, now_text, write_outputs
 from .facts import build_diagrams, collect_facts, update_index
@@ -23,10 +23,6 @@ from .sections import plan_chapters, write_chapter
 from .summarize import run_s2, run_s3, run_s4
 
 WORK_NAME = "design_doc"
-
-
-def work_dir_for(directory: str) -> str:
-    return os.path.join(os.path.abspath(directory), ".ai_audit", "work", WORK_NAME)
 
 
 def generate_design_doc(directory: str, output_dir: str | None = None, force: bool = False,
@@ -50,7 +46,7 @@ def generate_design_doc(directory: str, output_dir: str | None = None, force: bo
         rt.settings.tier = tier
     graph = update_index(abs_dir, log=log)
     facts = collect_facts(graph)
-    pipe = Pipeline(WORK_NAME, JobStore(work_dir_for(abs_dir)), rt, force=force,
+    pipe = Pipeline(WORK_NAME, JobStore(work_base(abs_dir), WORK_NAME), rt, force=force,
                     version=W.PROMPT_VERSION, quiet=quiet, lang=lang)
     pipe.stage("S1 事実の抽出")
     diagrams = build_diagrams(graph, facts)
