@@ -7,6 +7,7 @@
   - コード変更後は影響するステップだけ再実行する
 """
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -19,8 +20,9 @@ class StepFailed(Exception):
 
 class Pipeline:
     def __init__(self, name: str, store: JobStore, runtime=None, force: bool = False,
-                 version: str = "1", quiet: bool = False):
+                 version: str = "1", quiet: bool = False, lang: str = "ja"):
         self.name = name
+        self.lang = lang
         self.store = store
         self.runtime = runtime
         self.force = force
@@ -28,6 +30,7 @@ class Pipeline:
         self.quiet = quiet
         self.stats = {"run": 0, "reused": 0, "failed": 0}
         self.failures: list[tuple[str, str]] = []
+        self._lock = threading.Lock()
         self._status = {"pipeline": name, "started_at": time.time(), "finished_at": None,
                         "stage": "", "done": 0, "total": 0, "failed": 0, "reused": 0}
 
@@ -54,19 +57,24 @@ class Pipeline:
         if not self.force:
             hit, data = self.store.get(name, h)
             if hit:
-                self.stats["reused"] += 1
-                self._status["reused"] += 1
+                with self._lock:
+                    self.stats["reused"] += 1
+                    self._status["reused"] += 1
                 return data
         try:
             data = fn()
+        except StepFailed:
+            raise
         except Exception as e:  # ステップ単位で失敗を記録し、全体は継続できるようにする
-            self.stats["failed"] += 1
-            self._status["failed"] += 1
-            self.failures.append((name, str(e)))
+            with self._lock:
+                self.stats["failed"] += 1
+                self._status["failed"] += 1
+                self.failures.append((name, str(e)))
             print(f"  [ERROR] {name}: {e}", file=sys.stderr)
             raise StepFailed(name) from e
         self.store.put(name, h, data)
-        self.stats["run"] += 1
+        with self._lock:
+            self.stats["run"] += 1
         return data
 
     def map(self, items: list, name_fn, inputs_fn, fn, label_fn=None) -> list:
@@ -84,8 +92,9 @@ class Pipeline:
             return i, self.step(name_fn(item), inputs_fn(item), lambda: fn(item))
 
         def finish(i, ok):
-            self._status["done"] += 1
-            self.store.write_status(self._status)
+            with self._lock:
+                self._status["done"] += 1
+                self.store.write_status(self._status)
             label = label_fn(items[i]) if label_fn else name_fn(items[i])
             self.log(f"  [{self._status['done']}/{total}] {'OK ' if ok else 'NG '} {label}")
 
