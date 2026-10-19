@@ -25,8 +25,10 @@ _RETRY_DELAY = 2  # 秒
 def _get_settings() -> dict:
     """config.json → .env → デフォルト の優先順で設定を返す。"""
     # config_manager は循環参照を避けるため遅延 import
-    from .config_manager import load_config
-    return load_config()
+    from .core.config import load_settings
+    s = load_settings()
+    return {"api_base_url": s.api_base_url, "api_key": s.api_key,
+            "model_name": s.model_name, "max_output_tokens": s.max_output_tokens}
 
 
 def call_llm(system_prompt: str, user_content: str, json_mode: bool = True) -> str:

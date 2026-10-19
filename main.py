@@ -27,9 +27,9 @@ if sys.stderr.encoding and sys.stderr.encoding.lower() not in ("utf-8", "utf8"):
 # ---------------------------------------------------------------------------
 
 def cmd_config(args: argparse.Namespace) -> None:
-    from ai_audit.config_manager import (
+    from ai_audit.core.config import (
         fetch_ollama_models,
-        load_config,
+        load_settings,
         print_model_list,
         update_env_var,
         validate_env,
@@ -38,10 +38,10 @@ def cmd_config(args: argparse.Namespace) -> None:
     # --- サブアクション: model ---
     if args.config_action == "model":
         validate_env()
-        config = load_config()
-        print(f"Ollama ({config['api_base_url']}) からモデルリストを取得中...")
+        settings = load_settings()
+        print(f"Ollama ({settings.api_base_url}) からモデルリストを取得中...")
         try:
-            models = fetch_ollama_models(config["api_base_url"])
+            models = fetch_ollama_models(settings.api_base_url)
         except RuntimeError as e:
             print(f"[ERROR] {e}", file=sys.stderr)
             sys.exit(1)
@@ -74,8 +74,8 @@ def cmd_config(args: argparse.Namespace) -> None:
     elif args.config_action == "output-tokens":
         if args.value is None:
             # 表示のみ（validate_env 不要）
-            from dotenv import load_dotenv
-            load_dotenv()
+            from ai_audit.core.config import load_env
+            load_env()
             raw = os.getenv("LLM_MAX_OUTPUT_TOKENS", "").strip()
             if raw:
                 print(f"現在の最大出力トークン数: {raw}")
@@ -98,9 +98,9 @@ def cmd_config(args: argparse.Namespace) -> None:
 
     # --- サブアクション: show (デフォルト) ---
     else:
-        from dotenv import load_dotenv
-        load_dotenv()
-        env_path = os.path.join(os.getcwd(), ".env")
+        from ai_audit.core.config import get_env_path, load_env
+        load_env()
+        env_path = get_env_path()
 
         api_url   = os.getenv("LLM_API_BASE_URL", "（未設定）")
         api_key   = os.getenv("LLM_API_KEY",      "（未設定）")
@@ -144,7 +144,7 @@ def cmd_config(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_audit(args: argparse.Namespace) -> None:
-    from ai_audit.config_manager import validate_env
+    from ai_audit.core.config import validate_env
     validate_env()
 
     from ai_audit.usecase_a import audit_directory, audit_file, save_audit_json
@@ -167,14 +167,14 @@ def cmd_audit(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_extract_why(args: argparse.Namespace) -> None:
-    from ai_audit.config_manager import validate_env
+    from ai_audit.core.config import validate_env
     validate_env()
     from ai_audit.usecase_b import extract_why
     extract_why(args.directory, force=args.force)
 
 
 def cmd_search_why(args: argparse.Namespace) -> None:
-    from ai_audit.config_manager import validate_env
+    from ai_audit.core.config import validate_env
     validate_env()
     from ai_audit.usecase_b import print_search_results, search_why
     results = search_why(args.query, top_k=args.top_k)
@@ -188,7 +188,7 @@ def cmd_list_why(_args: argparse.Namespace) -> None:
 
 
 def cmd_review_architecture(args: argparse.Namespace) -> None:
-    from ai_audit.config_manager import validate_env
+    from ai_audit.core.config import validate_env
     validate_env()
     from ai_audit.usecase_c import review_architecture
     report = review_architecture(args.directory, output_file=args.output)
@@ -197,7 +197,7 @@ def cmd_review_architecture(args: argparse.Namespace) -> None:
 
 
 def cmd_generate_design_doc(args: argparse.Namespace) -> None:
-    from ai_audit.config_manager import validate_env
+    from ai_audit.core.config import validate_env
     validate_env()
     from ai_audit.usecase_d import generate_design_doc
     detail_path, overview_path = generate_design_doc(
