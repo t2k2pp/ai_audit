@@ -8,7 +8,7 @@ def test_graph_build_and_incremental(sample_project):
     assert g.file_deps["shop/service.py"] == {"shop/models.py"}
     assert g.file_deps["main.py"] == {"shop/service.py"}
     assert g.file_deps["web/api.ts"] == {"web/util.js"}
-    assert "sqlite3" in g.external_deps["shop/service.py"]
+    assert g.external_deps["shop/service.py"] == set()  # 標準ライブラリは除外
 
     # 呼び出し解決: checkout → Cart.total（import 先）、self.repo.save → OrderRepository.save
     callees = g.callees("shop/service.py::OrderService.checkout")

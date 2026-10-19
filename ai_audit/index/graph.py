@@ -22,7 +22,7 @@ from .model import Call, ImportRef, ParsedFile, Symbol
 from .parsers import parse_source
 from .scanner import read_source, scan_source_files, to_rel
 
-PARSER_VERSION = "2"
+PARSER_VERSION = "2"  # パーサ・保存形式を変えたら上げる（全ファイル再解析になる）
 ROOT_MODULE = "(root)"
 _JS_RESOLVE_EXT = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]
 
@@ -194,7 +194,9 @@ class CodeGraph:
     @staticmethod
     def _external_name(lang: str, imp: ImportRef) -> str:
         if lang == "python":
-            return "" if imp.level else imp.module.split(".")[0]
+            top = imp.module.split(".")[0]
+            # 標準ライブラリは外部依存として扱わない
+            return "" if imp.level or top in sys.stdlib_module_names else top
         if lang in ("javascript", "typescript"):
             if imp.module.startswith("."):
                 return ""
