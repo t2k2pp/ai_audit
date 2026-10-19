@@ -161,16 +161,18 @@ def cmd_config(args: argparse.Namespace) -> None:
 # 各ユースケース
 # ---------------------------------------------------------------------------
 def cmd_audit(args: argparse.Namespace) -> None:
-    _validated_settings()
-    from ai_audit.usecase_a import audit_directory, audit_file, save_audit_json
-    if os.path.isdir(args.path):
-        audit_directory(args.path, force=args.force, output_dir=args.output_dir)
-    elif os.path.isfile(args.path):
-        results = audit_file(args.path, force=args.force)
-        if results:
-            save_audit_json(args.path, results)
-    else:
+    from ai_audit.usecases.audit import audit_directory, audit_file
+    if not os.path.exists(args.path):
         _fail(f"ファイルまたはディレクトリが見つかりません: {args.path}")
+    rt = _runtime(args.tier)
+    try:
+        if os.path.isdir(args.path):
+            audit_directory(args.path, force=args.force, output_dir=args.output_dir, runtime=rt,
+                            verify=not args.no_verify, sarif=args.sarif)
+        else:
+            audit_file(args.path, force=args.force, runtime=rt, verify=not args.no_verify, root=args.root)
+    except (FileNotFoundError, ValueError) as e:
+        _fail(str(e))
 
 
 def cmd_extract_why(args: argparse.Namespace) -> None:
@@ -271,6 +273,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="キャッシュを無視して再監査する")
     p.add_argument("--output-dir", dest="output_dir", default=None, metavar="DIR",
                    help="結果 JSON の出力先（フォルダ監査時）")
+    p.add_argument("--tier", choices=TIER_CHOICES, default=None, help="ティアを指定（既定: 自動判定）")
+    p.add_argument("--no-verify", action="store_true", help="指摘の検証パスを行わない")
+    p.add_argument("--sarif", default=None, metavar="FILE", help="SARIF 形式でも出力する（フォルダ監査時）")
+    p.add_argument("--root", default=None, metavar="DIR",
+                   help="単一ファイル監査で文脈解析に使うルート（既定: git のルート）")
     p.set_defaults(func=cmd_audit)
 
     p = sub.add_parser("extract_why", help="設計思想を抽出して DB に蓄積する")

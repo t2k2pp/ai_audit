@@ -22,7 +22,7 @@ from .model import Call, ImportRef, ParsedFile, Symbol
 from .parsers import parse_source
 from .scanner import read_source, scan_source_files, to_rel
 
-PARSER_VERSION = "2"  # パーサ・保存形式を変えたら上げる（全ファイル再解析になる）
+PARSER_VERSION = "3"  # パーサ・保存形式を変えたら上げる（全ファイル再解析になる）
 ROOT_MODULE = "(root)"
 _JS_RESOLVE_EXT = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]
 
@@ -59,13 +59,16 @@ class CodeGraph:
         with self._connect() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS files (
-                    path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, lang TEXT, data TEXT NOT NULL
+                    path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, lang TEXT, data TEXT NOT NULL,
+                    mtime REAL, size INTEGER
                 );
                 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
             """)
             row = conn.execute("SELECT value FROM meta WHERE key='parser_version'").fetchone()
             if not row or row[0] != PARSER_VERSION:
-                conn.execute("DELETE FROM files")
+                conn.execute("DROP TABLE files")
+                conn.execute("""CREATE TABLE files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL,
+                                lang TEXT, data TEXT NOT NULL, mtime REAL, size INTEGER)""")
                 conn.execute("INSERT OR REPLACE INTO meta VALUES ('parser_version', ?)", (PARSER_VERSION,))
 
     def update(self, progress=None) -> dict:
@@ -75,20 +78,29 @@ class CodeGraph:
         """
         stats = {"added": 0, "changed": 0, "removed": 0, "unchanged": 0}
         with self._connect() as conn:
-            stored = dict(conn.execute("SELECT path, sha256 FROM files").fetchall())
+            stored = {p: (sha, mt, sz) for p, sha, mt, sz in
+                      conn.execute("SELECT path, sha256, mtime, size FROM files").fetchall()}
             seen = set()
             paths = list(scan_source_files(self.root))
             for i, abs_path in enumerate(paths, 1):
                 rel = to_rel(abs_path, self.root)
                 seen.add(rel)
+                st = os.stat(abs_path)
+                old = stored.get(rel)
+                if old and old[1] == st.st_mtime and old[2] == st.st_size:
+                    stats["unchanged"] += 1   # 更新日時・サイズが同じなら読み込みも省略
+                    continue
                 source = read_source(abs_path)
                 sha = hashlib.sha256(source.encode("utf-8")).hexdigest()
-                if stored.get(rel) == sha:
+                if old and old[0] == sha:
+                    conn.execute("UPDATE files SET mtime = ?, size = ? WHERE path = ?",
+                                 (st.st_mtime, st.st_size, rel))
                     stats["unchanged"] += 1
                     continue
                 pf = parse_source(rel, source)
-                conn.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?)",
-                             (rel, pf.sha256, pf.lang, json.dumps(asdict(pf), ensure_ascii=False)))
+                conn.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?, ?)",
+                             (rel, pf.sha256, pf.lang, json.dumps(asdict(pf), ensure_ascii=False),
+                              st.st_mtime, st.st_size))
                 stats["changed" if rel in stored else "added"] += 1
                 if progress:
                     progress(i, len(paths), rel)
