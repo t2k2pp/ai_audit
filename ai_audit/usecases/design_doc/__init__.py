@@ -11,7 +11,7 @@ import os
 import sys
 from dataclasses import asdict
 
-from ...core.budget import TIER_LARGE
+from ...core.budget import TIER_LARGE, compute_budget
 from ...core.runtime import Runtime, create_runtime
 from ...index.gitinfo import is_git_repo
 from ...pipeline.engine import Pipeline, StepFailed
@@ -42,8 +42,9 @@ def generate_design_doc(directory: str, output_dir: str | None = None, force: bo
     log = (lambda *a, **k: None) if quiet else print
 
     rt = runtime or create_runtime(tier=tier, quiet=quiet)
-    if tier and rt.settings.tier != tier:
+    if tier and rt.tier != tier:
         rt.settings.tier = tier
+        rt.budget = compute_budget(rt.settings, rt.profile)
     graph = update_index(abs_dir, log=log)
     facts = collect_facts(graph)
     pipe = Pipeline(WORK_NAME, JobStore(work_base(abs_dir), WORK_NAME), rt, force=force,

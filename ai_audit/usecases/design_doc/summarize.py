@@ -12,12 +12,15 @@ from .facts import facts_text
 # ---------------------------------------------------------------------------
 # S2: ファイル要約
 # ---------------------------------------------------------------------------
-def _symbol_table(graph: CodeGraph, path: str, top_only: bool = False) -> str:
+def _symbol_table(graph: CodeGraph, path: str, top_only: bool = False, max_rows: int = 0,
+                  with_signature: bool = True) -> str:
     rows = []
-    for s in graph.files[path].symbols:
-        if top_only and s.parent:
-            continue
-        rows.append(f"- {s.qualname} ({s.kind}) L{s.start_line}-{s.end_line}: {s.signature}")
+    syms = [s for s in graph.files[path].symbols if not (top_only and s.parent)]
+    for s in syms[:max_rows or None]:
+        sig = f": {s.signature[:120]}" if with_signature else ""
+        rows.append(f"- {s.qualname} ({s.kind}) L{s.start_line}-{s.end_line}{sig}")
+    if max_rows and len(syms) > max_rows:
+        rows.append(f"- …他 {len(syms) - max_rows} 件")
     return "\n".join(rows) or "（シンボルなし）"
 
 
@@ -38,7 +41,8 @@ def _file_header(graph: CodeGraph, path: str) -> list[tuple[str, str, object]]:
     return [
         ("info", "ファイル情報", "\n".join(info)),
         ("symbols", "シンボル一覧（行番号は正確）",
-         [_symbol_table(graph, path), _symbol_table(graph, path, top_only=True)]),
+         [_symbol_table(graph, path), _symbol_table(graph, path, top_only=True),
+          _symbol_table(graph, path, top_only=True, max_rows=30, with_signature=False)]),
     ]
 
 
@@ -52,7 +56,8 @@ def _related_parts(graph: CodeGraph, path: str) -> list[tuple[str, str]]:
     return parts
 
 
-def _split_by_symbols(graph: CodeGraph, path: str, source: str, rt, system: str) -> list[str]:
+def _split_by_symbols(graph: CodeGraph, path: str, source: str, rt, system: str,
+                      header_tokens: int) -> list[str]:
     """ファイルが大きすぎる場合、トップレベルシンボルの境界で行番号付きソースを分割する。"""
     lines = source.split("\n")
     tops = [s for s in graph.files[path].symbols if s.parent is None]
@@ -62,7 +67,7 @@ def _split_by_symbols(graph: CodeGraph, path: str, source: str, rt, system: str)
         end = bounds[i + 1] - 1 if i + 1 < len(bounds) else len(lines)
         if end >= start:
             segments.append((start, end))
-    limit = int(new_builder(rt, system).budget * 0.6)
+    limit = max(200, int((new_builder(rt, system).budget - header_tokens) * 0.85))
     chunks, cur_start, cur_end = [], None, None
     for start, end in segments:
         if cur_start is None:
@@ -130,7 +135,14 @@ def summarize_file(pipe, rt, graph: CodeGraph, path: str) -> dict:
         out = json_step(pipe, rt, f"s2/{path}", system, b, W.FILE_SUMMARY_SCHEMA)
     else:
         mode = "split"
-        chunks = _split_by_symbols(graph, path, source, rt, system)
+        # 分割時のヘッダはファイル情報＋トップレベルのシンボル（行番号のみ）に絞る
+        header = [header[0], ("symbols", "トップレベルのシンボル（行番号は正確）",
+                              [_symbol_table(graph, path, top_only=True, with_signature=False),
+                               _symbol_table(graph, path, top_only=True, max_rows=30, with_signature=False)])]
+        hb = new_builder(rt, system)
+        for k, title, text in header:
+            hb.add(k, title, text, required=True)
+        chunks = _split_by_symbols(graph, path, source, rt, system, hb.build(strict=False).tokens)
         items = [(f"部分{i + 1}", [c]) for i, c in enumerate(chunks)]
         partials = []
         for i, (key, alts_) in enumerate(items):

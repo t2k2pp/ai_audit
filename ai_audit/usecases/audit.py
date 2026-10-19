@@ -103,7 +103,7 @@ def _context_parts(graph: CodeGraph, unit: Unit, tier: str) -> list[tuple[str, s
     for caller_id in callers[:6 if tier == TIER_LARGE else 3]:
         caller = graph.symbols[caller_id]
         lines = graph.source_of(caller.file).split("\n")
-        call_lines = [line for src, dst, line, _ in graph.call_edges if src == caller_id and dst == unit.symbol_id]
+        call_lines = graph.call_lines(caller_id, unit.symbol_id)
         snippets = []
         for ln in call_lines[:2]:
             a, b = max(caller.start_line, ln - 4), min(caller.end_line, ln + 4)

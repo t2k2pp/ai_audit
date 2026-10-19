@@ -114,6 +114,7 @@ class CodeGraph:
         with self._connect() as conn:
             rows = conn.execute("SELECT data FROM files ORDER BY path").fetchall()
         self.files = {}
+        self._source_cache: dict[str, str] = {}
         for (data,) in rows:
             pf = _to_parsed(json.loads(data))
             self.files[pf.path] = pf
@@ -144,6 +145,14 @@ class CodeGraph:
                         external.add(ext)
             self.file_deps[path] = internal
             self.external_deps[path] = external
+        self._dependents: dict[str, set[str]] = defaultdict(set)
+        for src, targets in self.file_deps.items():
+            for dst in targets:
+                self._dependents[dst].add(src)
+        self._modules: dict[str, list[str]] = defaultdict(list)
+        for path in self.files:
+            self._modules[module_of(path)].append(path)
+        self._modules = dict(sorted(self._modules.items()))
         self._resolve_calls()
 
     def _python_module_map(self) -> dict[str, str]:
@@ -250,15 +259,17 @@ class CodeGraph:
                             chosen = scope[0]
                             break
                 self.call_edges.append((sym.id, chosen.id, call.line, conf))
+        self._callees: dict[str, set[str]] = defaultdict(set)
+        self._callers: dict[str, set[str]] = defaultdict(set)
+        for src, dst, _, _ in self.call_edges:
+            self._callees[src].add(dst)
+            self._callers[dst].add(src)
 
     # ------------------------------------------------------------------
     # 問い合わせ
     # ------------------------------------------------------------------
     def modules(self) -> dict[str, list[str]]:
-        mods: dict[str, list[str]] = defaultdict(list)
-        for path in self.files:
-            mods[module_of(path)].append(path)
-        return dict(sorted(mods.items()))
+        return self._modules
 
     def module_deps(self) -> dict[str, dict[str, int]]:
         """モジュール間依存（依存元 → {依存先: import 数}）。"""
@@ -277,17 +288,22 @@ class CodeGraph:
         return [s for s in self.symbols_in(symbol_id.split("::")[0]) if s.parent == symbol_id]
 
     def callees(self, symbol_id: str) -> list[str]:
-        return sorted({dst for src, dst, _, _ in self.call_edges if src == symbol_id})
+        return sorted(self._callees.get(symbol_id, ()))
 
     def callers(self, symbol_id: str) -> list[str]:
-        return sorted({src for src, dst, _, _ in self.call_edges if dst == symbol_id})
+        return sorted(self._callers.get(symbol_id, ()))
+
+    def call_lines(self, caller_id: str, callee_id: str) -> list[int]:
+        return [line for src, dst, line, _ in self.call_edges if src == caller_id and dst == callee_id]
 
     def dependents(self, path: str) -> list[str]:
         """path を import しているファイル。"""
-        return sorted(p for p, deps in self.file_deps.items() if path in deps)
+        return sorted(self._dependents.get(path, ()))
 
     def source_of(self, path: str) -> str:
-        return read_source(os.path.join(self.root, path))
+        if path not in self._source_cache:
+            self._source_cache[path] = read_source(os.path.join(self.root, path))
+        return self._source_cache[path]
 
     def symbol_source(self, symbol_id: str) -> str:
         sym = self.symbols[symbol_id]
@@ -383,7 +399,7 @@ class CodeGraph:
         if ref in self.symbols:
             return self.symbols[ref]
         name = ref.split("::")[-1]
-        for s in self.symbols.values():
+        for s in self._by_name.get(name.split(".")[-1], []):
             if s.qualname == name:
                 return s
         cands = self._by_name.get(name.split(".")[-1], [])

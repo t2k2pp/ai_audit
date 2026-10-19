@@ -47,11 +47,9 @@ def test_design_doc_compact_4096(fake_llm, sample_project, monkeypatch):
     reqs = fake_llm.chat_requests()
     # T1 では整合性レビューを行わない
     assert not any("設計書レビュアー" in r["messages"][0]["content"] for r in reqs)
-    # すべてのリクエストが 4096 の入力予算内（ダミーは 4 文字 = 1 トークン換算の usage を返す）
-    from ai_audit.core.budget import estimate_tokens
+    # すべてのリクエストが 4096 に収まる（ダミーサーバの数え方: 4 文字 = 1 トークン）
     for r in reqs:
-        text = "".join(m["content"] for m in r["messages"])
-        assert estimate_tokens(text) <= 4096
+        assert sum(len(m["content"]) for m in r["messages"]) // 4 + r.get("max_tokens", 0) <= 4096
     assert "compact" in (sample_project / "_design/README.md").read_text(encoding="utf-8")
 
 
