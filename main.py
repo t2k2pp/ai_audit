@@ -1,195 +1,197 @@
 #!/usr/bin/env python3
 """
-ai_audit - 120Bモデル×4096トークン環境向け 生成AI活用CLIツール
+ai_audit - ローカル LLM によるコード監査・アーキテクチャ解析・設計書生成ツール
+
+4096 トークン環境から 256K 級の大コンテキスト環境まで、コンテキスト長に応じて
+機能を上乗せする（ティア: compact / standard / large）。
 
 サブコマンド:
-  config                        LLM設定の表示・変更（モデル選択・最大トークン）
-  audit <path>                  ユースケースA: ファイルまたはフォルダの多重マイクロ監査
-  extract_why <directory>       ユースケースB: 設計思想の抽出・蓄積
-  search_why "<query>"          ユースケースB: 設計思想の自然言語検索
-  review_architecture <dir>     ユースケースC: ASTスケルトンによるアーキテクチャレビュー
-  generate_design_doc <dir>     ユースケースD: 設計書リバースビルド（詳細設計書・概要設計書を生成）
+  config                        設定の表示・変更、サーバ検出結果の確認
+  audit <path>                  監査（ファイルまたはフォルダ）
+  extract_why <directory>       設計思想の抽出・蓄積
+  search_why "<query>"          設計思想の自然言語検索
+  list_why                      蓄積済み設計思想の一覧
+  review_architecture <dir>     アーキテクチャレビュー
+  generate_design_doc <dir>     設計書の生成（概要・詳細・モジュール別・図・ADR）
+  status [<dir>]                直近ジョブの進捗表示
 """
 import argparse
 import io
+import json
 import os
 import sys
+import time
 
-# Windows の CP932 端末で絵文字等を含む UTF-8 出力が失敗するのを防ぐ
+# Windows の CP932 端末で UTF-8 出力が失敗するのを防ぐ
 if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 if sys.stderr.encoding and sys.stderr.encoding.lower() not in ("utf-8", "utf8"):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
+TIER_CHOICES = ["compact", "standard", "large"]
+
+
+def _fail(msg: str) -> None:
+    print(f"[ERROR] {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _validated_settings():
+    from ai_audit.core.config import load_settings, validate_env
+    validate_env()
+    try:
+        return load_settings()
+    except ValueError as e:
+        _fail(str(e))
+
+
+def _runtime(tier: str | None = None):
+    from ai_audit.core.runtime import create_runtime
+    return create_runtime(_validated_settings(), tier=tier)
+
 
 # ---------------------------------------------------------------------------
-# config コマンド
+# config
 # ---------------------------------------------------------------------------
-
 def cmd_config(args: argparse.Namespace) -> None:
     from ai_audit.core.config import (
         fetch_ollama_models,
+        get_env_path,
+        load_env,
         load_settings,
         print_model_list,
         update_env_var,
-        validate_env,
     )
 
-    # --- サブアクション: model ---
     if args.config_action == "model":
-        validate_env()
-        settings = load_settings()
+        settings = _validated_settings()
         print(f"Ollama ({settings.api_base_url}) からモデルリストを取得中...")
         try:
             models = fetch_ollama_models(settings.api_base_url)
         except RuntimeError as e:
-            print(f"[ERROR] {e}", file=sys.stderr)
-            sys.exit(1)
-
+            _fail(str(e))
         print_model_list(models)
-
         try:
             idx_str = input("切り替えるモデルの番号を入力してください (Enterでキャンセル): ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nキャンセルしました。")
             return
-
         if not idx_str:
             print("変更なし。")
             return
-
         try:
             idx = int(idx_str)
-            if not (0 <= idx < len(models)):
+            if not 0 <= idx < len(models):
                 raise ValueError
         except ValueError:
-            print(f"[ERROR] 0〜{len(models)-1} の番号を入力してください。", file=sys.stderr)
-            sys.exit(1)
+            _fail(f"0〜{len(models) - 1} の番号を入力してください。")
+        update_env_var("LLM_MODEL_NAME", models[idx]["name"])
+        print(f"[OK] モデルを {models[idx]['name']} に変更しました。(.env を更新)")
+        return
 
-        new_model = models[idx]["name"]
-        update_env_var("LLM_MODEL_NAME", new_model)
-        print(f"[OK] モデルを {new_model} に変更しました。(.env を更新)")
-
-    # --- サブアクション: output-tokens ---
-    elif args.config_action == "output-tokens":
+    if args.config_action == "output-tokens":
+        load_env()
         if args.value is None:
-            # 表示のみ（validate_env 不要）
-            from ai_audit.core.config import load_env
-            load_env()
             raw = os.getenv("LLM_MAX_OUTPUT_TOKENS", "").strip()
-            if raw:
-                print(f"現在の最大出力トークン数: {raw}")
-            else:
-                print("現在の最大出力トークン数: モデルのデフォルト最大値（指定なし）")
+            print(f"現在の最大出力トークン数: {raw or 'ティアに応じた既定値（指定なし）'}")
         elif args.value.lower() in ("auto", "none", ""):
-            # None = .env からキーをコメントアウト
             update_env_var("LLM_MAX_OUTPUT_TOKENS", None)
-            print("[OK] 最大出力トークン数をモデルのデフォルト最大値（指定なし）に設定しました。(.env を更新)")
+            print("[OK] 最大出力トークン数を自動（ティアに応じた既定値）にしました。(.env を更新)")
         else:
             try:
-                new_tokens = int(args.value)
-                if new_tokens < 64:
+                n = int(args.value)
+                if n < 64:
                     raise ValueError("最小値は 64 です。")
             except ValueError as e:
-                print(f"[ERROR] {e}", file=sys.stderr)
-                sys.exit(1)
-            update_env_var("LLM_MAX_OUTPUT_TOKENS", str(new_tokens))
-            print(f"[OK] 最大出力トークン数を {new_tokens} に変更しました。(.env を更新)")
+                _fail(str(e))
+            update_env_var("LLM_MAX_OUTPUT_TOKENS", str(n))
+            print(f"[OK] 最大出力トークン数を {n} に変更しました。(.env を更新)")
+        return
 
-    # --- サブアクション: show (デフォルト) ---
-    else:
-        from ai_audit.core.config import get_env_path, load_env
-        load_env()
-        env_path = get_env_path()
+    if args.config_action == "probe":
+        from ai_audit.core.budget import compute_budget
+        from ai_audit.core.server_probe import probe_server
+        settings = _validated_settings()
+        profile = probe_server(settings, use_cache=False)
+        budget = compute_budget(settings, profile)
+        print(f"サーバ種別       : {profile.server_type}")
+        print(f"最大コンテキスト : {profile.context_length:,}（取得元: {profile.context_source}）")
+        print(f"トークナイザ     : {profile.tokenize or 'なし（推定値を使用）'}")
+        print(budget.describe())
+        for w in profile.warnings:
+            print(f"[WARN] {w}")
+        return
 
-        api_url   = os.getenv("LLM_API_BASE_URL", "（未設定）")
-        api_key   = os.getenv("LLM_API_KEY",      "（未設定）")
-        model     = os.getenv("LLM_MODEL_NAME",   "（未設定）")
-        raw_max   = os.getenv("LLM_MAX_OUTPUT_TOKENS", "").strip()
-        max_out   = raw_max if raw_max else "モデルのデフォルト最大値（指定なし）"
-
-        # APIキーは末尾4文字だけ表示（セキュリティ配慮）
-        if api_key not in ("（未設定）",) and len(api_key) > 4:
-            api_key_display = "*" * (len(api_key) - 4) + api_key[-4:]
-        else:
-            api_key_display = api_key
-
-        print("\n現在の設定:（すべて .env から読み込み）")
-        print(f"  API URL          : {api_url}")
-        print(f"  API Key          : {api_key_display}")
-        print(f"  モデル名         : {model}")
-        print(f"  最大出力トークン : {max_out}")
-        print(f"  設定ファイル     : {env_path}")
-        print()
-        print("変更するには:")
-        print("  python main.py config model                      # モデルをインデックスで選択")
-        print("  python main.py config output-tokens 4096         # 最大出力トークン数を変更")
-        print("  python main.py config output-tokens auto         # モデルのデフォルト最大値を使用")
-        print()
-        print("  ※ API URL / API Key は .env を直接編集してください。")
-
-        # 未設定項目があれば警告（LLM_API_KEY は任意のため除外）
-        missing = [v for v in ("LLM_API_BASE_URL", "LLM_MODEL_NAME")
-                   if not os.getenv(v, "").strip()]
-        if missing:
-            print()
-            print("[WARNING] 以下の必須項目が未設定です:")
-            for v in missing:
-                print(f"  {v}")
-            print("  .env.example を参考に .env を設定してください。")
+    # show
+    load_env()
+    try:
+        s = load_settings()
+    except ValueError as e:
+        _fail(str(e))
+    key = s.api_key
+    key_display = ("*" * (len(key) - 4) + key[-4:]) if len(key) > 4 else (key or "（未設定）")
+    print("\n現在の設定:（.env / 環境変数から読み込み）")
+    rows = [
+        ("API URL", s.api_base_url or "（未設定）"),
+        ("API Key", key_display),
+        ("モデル名", s.model_name or "（未設定）"),
+        ("最大出力トークン", s.max_output_tokens or "自動"),
+        ("最大コンテキスト", s.context_length or "自動取得"),
+        ("実効予算の上限", s.context_budget or "自動"),
+        ("ティア", s.tier or "自動判定"),
+        ("思考モード", s.reasoning),
+        ("追加パラメータ", json.dumps(s.extra_body, ensure_ascii=False) if s.extra_body else "なし"),
+        ("同時リクエスト数", s.parallel),
+        ("埋め込みモデル", s.embedding_model or "（未設定: ChromaDB 既定）"),
+        ("設定ファイル", get_env_path()),
+    ]
+    for label, value in rows:
+        print(f"  {label:<10}: {value}")
+    print("\n変更・確認:")
+    print("  python main.py config model                # モデルを一覧から選択")
+    print("  python main.py config output-tokens 4096   # 最大出力トークン数を変更")
+    print("  python main.py config probe                # サーバ検出結果とティアを表示")
+    print("  ※ その他の項目は .env を直接編集してください（.env.example 参照）。")
+    missing = [v for v in ("LLM_API_BASE_URL", "LLM_MODEL_NAME") if not os.getenv(v, "").strip()]
+    if missing:
+        print("\n[WARNING] 必須項目が未設定です: " + ", ".join(missing))
 
 
 # ---------------------------------------------------------------------------
-# audit コマンド
+# 各ユースケース
 # ---------------------------------------------------------------------------
-
 def cmd_audit(args: argparse.Namespace) -> None:
-    from ai_audit.core.config import validate_env
-    validate_env()
-
+    _validated_settings()
     from ai_audit.usecase_a import audit_directory, audit_file, save_audit_json
-
-    path = args.path
-
-    if os.path.isdir(path):
-        audit_directory(path, force=args.force, output_dir=args.output_dir)
-    elif os.path.isfile(path):
-        results = audit_file(path, force=args.force)
+    if os.path.isdir(args.path):
+        audit_directory(args.path, force=args.force, output_dir=args.output_dir)
+    elif os.path.isfile(args.path):
+        results = audit_file(args.path, force=args.force)
         if results:
-            save_audit_json(path, results)
+            save_audit_json(args.path, results)
     else:
-        print(f"[ERROR] ファイルまたはディレクトリが見つかりません: {path}", file=sys.stderr)
-        sys.exit(1)
+        _fail(f"ファイルまたはディレクトリが見つかりません: {args.path}")
 
-
-# ---------------------------------------------------------------------------
-# その他コマンド
-# ---------------------------------------------------------------------------
 
 def cmd_extract_why(args: argparse.Namespace) -> None:
-    from ai_audit.core.config import validate_env
-    validate_env()
+    _validated_settings()
     from ai_audit.usecase_b import extract_why
     extract_why(args.directory, force=args.force)
 
 
 def cmd_search_why(args: argparse.Namespace) -> None:
-    from ai_audit.core.config import validate_env
-    validate_env()
+    _validated_settings()
     from ai_audit.usecase_b import print_search_results, search_why
-    results = search_why(args.query, top_k=args.top_k)
-    print_search_results(results)
+    print_search_results(search_why(args.query, top_k=args.top_k))
 
 
 def cmd_list_why(_args: argparse.Namespace) -> None:
     from ai_audit.usecase_b import list_why, print_list_results
-    results = list_why()
-    print_list_results(results)
+    print_list_results(list_why())
 
 
 def cmd_review_architecture(args: argparse.Namespace) -> None:
-    from ai_audit.core.config import validate_env
-    validate_env()
+    _validated_settings()
     from ai_audit.usecase_c import review_architecture
     report = review_architecture(args.directory, output_file=args.output)
     if not args.output:
@@ -197,192 +199,130 @@ def cmd_review_architecture(args: argparse.Namespace) -> None:
 
 
 def cmd_generate_design_doc(args: argparse.Namespace) -> None:
-    from ai_audit.core.config import validate_env
-    validate_env()
-    from ai_audit.usecase_d import generate_design_doc
-    detail_path, overview_path = generate_design_doc(
-        args.directory,
-        output_dir=args.output_dir,
-        force=args.force,
-    )
-    print(f"[DONE] 詳細設計書: {detail_path}")
-    print(f"[DONE] 概要設計書: {overview_path}")
+    rt = _runtime(args.tier)
+    from ai_audit.usecases.design_doc import generate_design_doc
+    adr = True if args.adr else (False if args.no_adr else None)
+    try:
+        out = generate_design_doc(args.directory, output_dir=args.output_dir, force=args.force,
+                                  tier=args.tier, layout=args.layout, lang=args.lang,
+                                  verify=not args.no_verify, adr=adr, runtime=rt)
+    except (FileNotFoundError, ValueError) as e:
+        _fail(str(e))
+    if not out["files"]:
+        sys.exit(1)
+    print(f"[DONE] 設計書: {out['output_dir']}")
+    if not out["ok"]:
+        print("[WARN] 一部のステップが失敗しました。同じコマンドを再実行すると続きから処理します。",
+              file=sys.stderr)
+        sys.exit(2)
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    from ai_audit.pipeline.jobstore import JobStore
+    base = os.path.join(os.path.abspath(args.directory), ".ai_audit", "work")
+    if not os.path.isdir(base):
+        print("ジョブの記録がありません。")
+        return
+    for name in sorted(os.listdir(base)):
+        st = JobStore(os.path.join(base, name)).read_status()
+        if not st:
+            continue
+        started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st["started_at"]))
+        state = "完了" if st.get("finished_at") else "実行中または中断"
+        progress = f"{st['done']}/{st['total']}" if st.get("total") else "-"
+        print(f"[{name}] {state} / 開始 {started} / 段階: {st['stage']} / 進捗 {progress} / "
+              f"再利用 {st.get('reused', 0)} / 失敗 {st.get('failed', 0)}")
 
 
 # ---------------------------------------------------------------------------
 # パーサー定義
 # ---------------------------------------------------------------------------
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai_audit",
-        description="120Bモデル×4096トークン環境向け 生成AI活用CLIツール",
+        description="ローカル LLM によるコード監査・アーキテクチャ解析・設計書生成ツール",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用例:
-  # 設定確認・変更
-  python main.py config                           # 現在の設定を表示
-  python main.py config model                     # モデル一覧を表示してインデックスで切り替え
-  python main.py config output-tokens 4096        # 最大出力トークン数を 4096 に変更
-  python main.py config output-tokens auto        # モデルのデフォルト最大値を使用（指定なし）
-
-  # ユースケースA: 監査
-  python main.py audit src/user_service.py        # 単一ファイル
-  python main.py audit ./src                      # フォルダ一括
-  python main.py audit ./src --output-dir ./audit_results
-
-  # ユースケースB
-  python main.py extract_why ./src
-  python main.py search_why "レガシーAPIとの互換性のために複雑な実装をしている箇所"
-
-  # ユースケースC
+  python main.py config                            # 現在の設定を表示
+  python main.py config probe                      # サーバ検出結果・ティアを表示
+  python main.py generate_design_doc ./src         # 設計書を ./src/_design/ に生成
+  python main.py generate_design_doc ./src --tier compact   # 4096 環境向けの動作を強制
+  python main.py status ./src                      # 直近ジョブの進捗
+  python main.py audit ./src
   python main.py review_architecture ./src --output report.md
 """,
     )
+    sub = parser.add_subparsers(dest="command", required=True)
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("config", help="設定の表示・変更、サーバ検出結果の確認")
+    p.add_argument("config_action", nargs="?", choices=["show", "model", "output-tokens", "probe"],
+                   default="show", help="show（既定）/ model / output-tokens / probe")
+    p.add_argument("value", nargs="?", default=None, help="output-tokens の値（整数 または auto）")
+    p.set_defaults(func=cmd_config)
 
-    # --- config ---
-    p_config = subparsers.add_parser(
-        "config",
-        help="LLM設定の表示・変更（モデル選択・最大トークン数）",
+    p = sub.add_parser("audit", help="ファイルまたはフォルダを監査する")
+    p.add_argument("path", help="監査対象のファイルまたはディレクトリ")
+    p.add_argument("--force", action="store_true", help="キャッシュを無視して再監査する")
+    p.add_argument("--output-dir", dest="output_dir", default=None, metavar="DIR",
+                   help="結果 JSON の出力先（フォルダ監査時）")
+    p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser("extract_why", help="設計思想を抽出して DB に蓄積する")
+    p.add_argument("directory", help="対象ディレクトリ")
+    p.add_argument("--force", action="store_true", help="変更の有無に関わらず全件を再抽出する")
+    p.set_defaults(func=cmd_extract_why)
+
+    p = sub.add_parser("search_why", help="蓄積した設計思想を自然言語で検索する")
+    p.add_argument("query", help="検索クエリ")
+    p.add_argument("--top-k", type=int, default=5, help="最大件数（既定: 5）")
+    p.set_defaults(func=cmd_search_why)
+
+    p = sub.add_parser("list_why", help="蓄積済み設計思想の一覧を表示する")
+    p.set_defaults(func=cmd_list_why)
+
+    p = sub.add_parser("review_architecture", help="アーキテクチャをレビューする")
+    p.add_argument("directory", help="対象ディレクトリ")
+    p.add_argument("--output", default=None, help="結果を保存する Markdown ファイル")
+    p.set_defaults(func=cmd_review_architecture)
+
+    p = sub.add_parser(
+        "generate_design_doc", help="ソースコードから設計書を生成する",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-サブアクション:
-  (なし)                   現在の設定を表示（.env の内容）
-  model                    Ollamaモデル一覧をインデックス付きで表示し、番号で切り替え
-                             → .env の LLM_MODEL_NAME を更新する
-  output-tokens [値]       最大出力トークン数を表示または変更
-                             → .env の LLM_MAX_OUTPUT_TOKENS を更新する
-                             整数値: その値を上限として指定
-                             auto  : モデルのデフォルト最大値を使用（指定なし）
+出力（既定: <directory>/_design/）:
+  README.md        目次・生成条件・カバレッジ
+  overview.md      概要設計書（非エンジニア・再実装用）
+  detail.md        詳細設計書（保守担当者向け）
+  modules/*.md     モジュール別の設計
+  diagrams/*.mmd   静的解析から生成した Mermaid 図
+  adr/*.md         設計判断の記録（large ティア＋git 管理下のとき）
+  _meta/coverage.json
 
-  ※ API URL / API Key は .env を直接編集してください。
-
-例:
-  python main.py config
-  python main.py config model
-  python main.py config output-tokens
-  python main.py config output-tokens 4096
-  python main.py config output-tokens auto
+再開: 途中で止まっても、同じコマンドを再実行すると完了済みの部分を再利用して続きから処理します。
+      コードを変更した場合は、影響する部分だけを再生成します。--force で全再生成。
 """,
     )
-    p_config.add_argument(
-        "config_action",
-        nargs="?",
-        choices=["model", "output-tokens", "show"],
-        default="show",
-        help="実行するアクション（省略時: show）",
-    )
-    p_config.add_argument(
-        "value",
-        nargs="?",
-        default=None,
-        help="output-tokens アクション時の設定値",
-    )
-    p_config.set_defaults(func=cmd_config)
+    p.add_argument("directory", help="対象ディレクトリ")
+    p.add_argument("--output-dir", dest="output_dir", default=None, metavar="DIR", help="出力先")
+    p.add_argument("--force", action="store_true", help="保存済みの途中結果を使わず全再生成する")
+    p.add_argument("--tier", choices=TIER_CHOICES, default=None, help="ティアを指定（既定: 自動判定）")
+    p.add_argument("--layout", choices=["v2", "legacy"], default="v2",
+                   help="出力レイアウト（legacy: v0.3 互換の _design_detail.md / _design_overview.md）")
+    p.add_argument("--lang", choices=["ja", "en"], default="ja", help="出力言語（既定: ja）")
+    p.add_argument("--no-verify", action="store_true", help="整合性レビューを行わない")
+    p.add_argument("--adr", action="store_true", help="ADR を必ず生成する（git 履歴を使用）")
+    p.add_argument("--no-adr", action="store_true", help="ADR を生成しない")
+    p.set_defaults(func=cmd_generate_design_doc)
 
-    # --- audit ---
-    p_audit = subparsers.add_parser(
-        "audit",
-        help="ユースケースA: ファイルまたはフォルダをセキュリティ・クリーンコードの観点で多重監査する",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-引数:
-  path にファイルを指定 → 単一ファイルを監査し <ファイル名>_audit.json を出力
-  path にフォルダを指定 → 配下の全 .py ファイルを一括監査し _summary_audit.json も出力
-
-出力先:
-  --output-dir 未指定: 各ファイルと同じディレクトリに _audit.json を出力
-  --output-dir 指定:   ディレクトリ構造を保持して指定先に集約出力
-""",
-    )
-    p_audit.add_argument("path", help="監査対象のPythonファイルまたはディレクトリ")
-    p_audit.add_argument("--force", action="store_true", default=False, help="キャッシュを無視して再監査する")
-    p_audit.add_argument("--output-dir", dest="output_dir", default=None, metavar="DIR",
-                         help="結果JSONの出力先ディレクトリ（フォルダ一括監査時のみ有効）")
-    p_audit.set_defaults(func=cmd_audit)
-
-    # --- extract_why ---
-    p_extract = subparsers.add_parser(
-        "extract_why",
-        help="ユースケースB: ディレクトリ内の全関数の設計思想を抽出してDBに蓄積する",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-変更検知:
-  コードが変更された関数のみ自動的に再抽出します（content_hash で検知）。
-  変更のない関数はスキップされるため、API コストを節約できます。
-  --force を指定すると変更の有無に関わらず全件を再抽出します。
-""",
-    )
-    p_extract.add_argument("directory", help="スキャン対象のディレクトリ")
-    p_extract.add_argument("--force", action="store_true", default=False,
-                           help="変更の有無に関わらず全件を再抽出する")
-    p_extract.set_defaults(func=cmd_extract_why)
-
-    # --- search_why ---
-    p_search = subparsers.add_parser(
-        "search_why",
-        help="ユースケースB: 蓄積した設計思想を自然言語クエリで検索する",
-    )
-    p_search.add_argument("query", help="検索クエリ（自然言語）")
-    p_search.add_argument("--top-k", type=int, default=5, help="返す結果の最大件数（デフォルト: 5）")
-    p_search.set_defaults(func=cmd_search_why)
-
-    # --- list_why ---
-    p_list = subparsers.add_parser(
-        "list_why",
-        help="ユースケースB: 蓄積済み設計思想の一覧を表示する",
-    )
-    p_list.set_defaults(func=cmd_list_why)
-
-    # --- review_architecture ---
-    p_review = subparsers.add_parser(
-        "review_architecture",
-        help="ユースケースC: ASTスケルトン解析でアーキテクチャをレビューする",
-    )
-    p_review.add_argument("directory", help="レビュー対象のディレクトリ")
-    p_review.add_argument("--output", "-o", default=None,
-                          help="レポートを保存するMarkdownファイルパス（省略時は標準出力）")
-    p_review.set_defaults(func=cmd_review_architecture)
-
-    # --- generate_design_doc ---
-    p_design = subparsers.add_parser(
-        "generate_design_doc",
-        help="ユースケースD: ソースコードから設計書をリバースビルドする（詳細設計書・概要設計書を生成）",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-出力ファイル（対象ディレクトリまたは --output-dir 直下）:
-  _design_detail.md   内部（詳細）設計書: クラス図・関数一覧・データフロー等
-  _design_overview.md 外部（概要）設計書: システム概要・ユースケース・構成図等
-
-再開機能:
-  _design_detail.md が存在する場合は詳細生成をスキップし概要生成のみ実行します。
-  最初からやり直す場合は --force を指定してください。
-
-対応言語:
-  Python (.py) / JavaScript (.js / .jsx) / TypeScript (.ts / .tsx)
-  ※ JS/TS が含まれる場合は JS/TS固有の観点に関する付記が出力に追加されます。
-
-例:
-  main.py generate_design_doc ./src
-  main.py generate_design_doc ./src --output-dir ./docs
-  main.py generate_design_doc ./src --force
-""",
-    )
-    p_design.add_argument("directory", help="対象ソースディレクトリ")
-    p_design.add_argument("--output-dir", dest="output_dir", default=None, metavar="DIR",
-                          help="設計書の出力先ディレクトリ（省略時は対象ディレクトリ直下）")
-    p_design.add_argument("--force", action="store_true", default=False,
-                          help="既存の設計書を無視して全体を再生成する")
-    p_design.set_defaults(func=cmd_generate_design_doc)
-
+    p = sub.add_parser("status", help="直近ジョブの進捗を表示する")
+    p.add_argument("directory", nargs="?", default=".", help="対象ディレクトリ（既定: カレント）")
+    p.set_defaults(func=cmd_status)
     return parser
 
 
 def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
+    args = build_parser().parse_args()
     args.func(args)
 
 
