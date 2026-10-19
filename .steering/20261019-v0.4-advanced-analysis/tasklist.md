@@ -5,7 +5,7 @@
 ## フェーズ1: リポジトリ整理・テスト基盤
 - [x] T1-01 `.gitignore` 整理（`.steering/` 追跡、コミット済み vsix / out を管理外へ、`*_why.json`）
 - [x] T1-02 devcontainer を Python 3.13＋Node に、CLAUDE.md 技術スタック更新、TaskCLI アイデア削除
-- [ ] T1-03 単一ソース化（ルート main.py を最新化、`vscode-extension/python/` を管理外、ビルドスクリプトを requirements.txt ベースに統一）【B5, B6】
+- [x] T1-03 単一ソース化（ルート main.py を最新化、`vscode-extension/python/` を管理外、ビルドスクリプトを requirements.txt ベースに統一）【B5, B6】
 - [ ] T1-04 テスト基盤（requirements-dev.txt、pytest 設定、ダミー LLM サーバ、サンプルプロジェクト）
 
 ## フェーズ2: 共通基盤

@@ -1,0 +1,8 @@
+# ai_audit コア依存（VSCode 拡張のバイナリにも同梱する）
+# Python 3.10 以上
+requests==2.32.3
+python-dotenv==1.0.1
+tree-sitter>=0.23
+tree-sitter-javascript
+tree-sitter-typescript
+tree-sitter-language-pack

@@ -31,3 +31,4 @@ bin/**/.gitkeep
 build_win.ps1
 build_mac.sh
 build_linux.sh
+build_backend.py
