@@ -10,7 +10,7 @@
 
 ## フェーズ2: 共通基盤
 - [x] T2-01 パッケージ再編（core/config, 既存モジュールの移動と import 更新）
-- [ ] T2-02 server_probe（llama.cpp / vLLM / Ollama / 手動）
+- [x] T2-02 server_probe（llama.cpp / vLLM / Ollama / 手動）
 - [ ] T2-03 budget（実効予算・ティア判定・トークン計測・自己補正）
 - [ ] T2-04 llm_client v2（json_schema→json_object→修復、思考除去、EXTRA_BODY、リトライ方針、使用量記録）
 - [ ] T2-05 パーサ v2（シンボル: 修飾名・親子・行範囲・import・呼び出し・継承）【B1, B2】

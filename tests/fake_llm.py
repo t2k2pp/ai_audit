@@ -19,6 +19,7 @@ class FakeLLM:
         self.responder = lambda req: "{}"
         self.fail_next = 0          # 次の N 回は 500 を返す
         self.reasoning = None       # reasoning_content に入れる文字列
+        self.mode = "llamacpp"      # llamacpp / ollama / plain（検出 API なし）
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
@@ -54,7 +55,7 @@ class FakeLLM:
                 self.wfile.write(data)
 
             def do_GET(self):
-                if self.path == "/props":
+                if self.path == "/props" and fake.mode == "llamacpp":
                     self._send(200, {"default_generation_settings": {"n_ctx": fake.n_ctx},
                                      "n_ctx": fake.n_ctx})
                 elif self.path == "/v1/models":
@@ -67,7 +68,10 @@ class FakeLLM:
                 req = json.loads(self.rfile.read(length) or b"{}")
                 req["_path"] = self.path
                 fake.requests.append(req)
-                if self.path == "/tokenize":
+                if self.path == "/api/show" and fake.mode == "ollama":
+                    self._send(200, {"model_info": {"qwen.context_length": fake.n_ctx},
+                                     "parameters": ""})
+                elif self.path == "/tokenize" and fake.mode == "llamacpp":
                     text = req.get("content", "")
                     self._send(200, {"tokens": list(range(max(1, len(text) // 4)))})
                 elif self.path == "/v1/embeddings":
