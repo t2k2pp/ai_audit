@@ -13,7 +13,7 @@
 - [x] T2-02 server_probe（llama.cpp / vLLM / Ollama / 手動）
 - [x] T2-03 budget（実効予算・ティア判定・トークン計測・自己補正）
 - [x] T2-04 llm_client v2（json_schema→json_object→修復、思考除去、EXTRA_BODY、リトライ方針、使用量記録）
-- [ ] T2-05 パーサ v2（シンボル: 修飾名・親子・行範囲・import・呼び出し・継承）【B1, B2】
+- [x] T2-05 パーサ v2（シンボル: 修飾名・親子・行範囲・import・呼び出し・継承）【B1, B2】
 - [ ] T2-06 Code Graph（SQLite、差分更新、問い合わせ）
 - [ ] T2-07 ジョブストア・パイプラインエンジン（入力ハッシュ、原子的書き込み、再開、status コマンド）
 
