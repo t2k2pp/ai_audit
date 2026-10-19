@@ -40,5 +40,5 @@
 
 ## フェーズ7: 追従・仕上げ
 - [x] T7-01 VSCode 拡張追従（新レイアウト、JS/TS の監査結果パス、行番号、Why JSON、設定項目）
-- [ ] T7-02 README・`.env.example`・既存設計書の更新
+- [x] T7-02 README・`.env.example`・既存設計書の更新
 - [ ] T7-03 全テスト・TypeScript コンパイル確認、振り返り記録

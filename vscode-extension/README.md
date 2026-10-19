@@ -4,7 +4,8 @@ AIを使ったコードレビューをVSCodeに統合します。
 ファイルを保存するだけで自動的に監査が走り、問題のある行に波線と修正提案が表示されます。
 
 > **対応OS**: Windows / macOS / Linux（OS別にVSIXが異なります）
-> **対応言語**: Python / JavaScript / TypeScript（v0.3.0〜）
+> **対応言語**: Python / JavaScript / TypeScript / Dart
+> **v0.4**: 4096 トークン環境から 256K 級の大コンテキストまで対応（ティアを自動判定）
 
 ---
 
@@ -37,14 +38,15 @@ AIを使ったコードレビューをVSCodeに統合します。
 | 設定項目 | 説明 | 例 |
 |---|---|---|
 | `aiAudit.apiBaseUrl` | **[必須]** LLM APIのURL | `http://192.168.1.40:11434/v1` |
-| `aiAudit.apiKey` | **[必須]** APIキー | `ollama` |
-| `aiAudit.modelName` | **[必須]** 使用するモデル名 | `qwen2.5-coder:32b` |
+| `aiAudit.apiKey` | APIキー（不要なサーバでは空） | |
+| `aiAudit.modelName` | **[必須]** 使用するモデル名 | `qwen3.8-flash-next` |
+| `aiAudit.contextLength` | 最大コンテキスト（空 = サーバから自動取得。Ollama は指定推奨） | `262144` |
 
 > **モデル名がわからない場合**: `Ctrl+Shift+P` → `ai_audit: モデル一覧を表示・切り替え` を実行すると、接続先のOllamaで使えるモデルが一覧表示され、クリックで選択できます。
 
 ### ステップ 3: 使い始める
 
-**これだけです。** Python / JavaScript / TypeScript ファイルを開いて `Ctrl+S` で保存してください。
+**これだけです。** Python / JavaScript / TypeScript / Dart ファイルを開いて `Ctrl+S` で保存してください。
 
 数秒後に問題のある行へ波線が出ます。波線にカーソルを合わせると指摘内容と修正提案が表示されます。
 
@@ -54,7 +56,8 @@ AIを使ったコードレビューをVSCodeに統合します。
 
 ### 自動監査（保存時）
 
-Python / JavaScript / TypeScript ファイルを **Ctrl+S で保存するだけ** で監査が始まります。
+Python / JavaScript / TypeScript / Dart ファイルを **Ctrl+S で保存するだけ** で監査が始まります。
+指摘は問題の行に表示されます（v0.4 で行番号の精度を改善）。
 
 - 赤波線 = `high` 重要度（セキュリティ脆弱性など）
 - 黄波線 = `medium` 重要度（保守性の問題など）
@@ -87,22 +90,28 @@ Python / JavaScript / TypeScript ファイルを **Ctrl+S で保存するだけ*
 
 ---
 
-## 設計書逆生成について（v0.3.0〜）
+## 設計書の生成（v0.4）
 
-フォルダを右クリック → `ai_audit: ドキュメント生成：設計書` を実行すると、
-コードを解析して **2つの設計書** をフォルダ直下に自動生成します：
+フォルダを右クリック → `ai_audit: ドキュメント生成：設計書` を実行すると、フォルダ直下の `_design/` に生成します。
 
-| ファイル名 | 内容 |
+| ファイル | 内容 |
 |---|---|
-| `_design_detail.md` | 詳細設計書（関数・クラスレベルの構造、Mermaid図付き） |
-| `_design_overview.md` | 概要設計書（外部向けの機能・構成サマリー） |
+| `README.md` | 目次・生成条件・カバレッジ |
+| `overview.md` | 概要設計書（機能・構成・用語集） |
+| `detail.md` | 詳細設計書（構成・処理フロー・データ・横断的関心事・課題） |
+| `modules/*.md` | モジュール別設計（クラス図・公開シンボル一覧） |
+| `adr/*.md` | 設計判断の記録（large ティア＋git 管理下のみ） |
 
-**ユースケース例:**
-- ドキュメントが存在しないレガシーコードから設計書を起こしたい
-- スパゲッティコードをAIにリファクタリングしてもらうための入力資料を作りたい
+- 図は静的解析から機械的に生成し、本文の根拠 `[パス:行]` はソースへのリンクになります。
+- 処理中はステータスバーに段階と進捗が表示されます。
+- 途中で止まっても、もう一度実行すると続きから処理します。コード変更後は変更部分だけを再生成します。
+- Mermaid 図をプレビューで表示するには、Mermaid 対応の Markdown プレビュー拡張を入れてください。
 
-> ⚠️ 処理に時間がかかる場合があります（ファイル数・コード量による）。
-> 途中で中断した場合、`_design_detail.md` が存在すれば概要生成から再開します。
+## 設計思想機能（v0.4）
+
+`ai_audit: 設計思想機能を有効にする` で有効化します（**追加のインストールは不要**。v0.3 の Python・ChromaDB は不要になりました）。
+抽出結果はフォルダの `.ai_audit/` に保存され、CodeLens・サイドバーで表示されます。
+v0.3 で蓄積したデータは引き継がれないため、再度抽出してください。
 
 ---
 
@@ -113,9 +122,17 @@ Python / JavaScript / TypeScript ファイルを **Ctrl+S で保存するだけ*
 | 設定キー | デフォルト | 説明 |
 |---|---|---|
 | `aiAudit.apiBaseUrl` | `""` | **[必須]** LLM APIのURL |
-| `aiAudit.apiKey` | `""` | **[必須]** APIキー |
+| `aiAudit.apiKey` | `""` | APIキー（任意） |
 | `aiAudit.modelName` | `""` | **[必須]** 使用するモデル名 |
-| `aiAudit.maxOutputTokens` | `null` | 最大出力トークン数（nullでモデルのデフォルト） |
+| `aiAudit.maxOutputTokens` | `null` | 最大出力トークン数（null = ティアに応じた既定値） |
+| `aiAudit.contextLength` | `null` | 最大コンテキスト長（null = サーバから自動取得） |
+| `aiAudit.contextBudget` | `null` | 1 リクエストのトークン上限（null = 自動） |
+| `aiAudit.tier` | `auto` | ティア（auto / compact / standard / large） |
+| `aiAudit.reasoning` | `off` | 思考モード（off / low / medium / high） |
+| `aiAudit.extraBody` | `""` | リクエストに追加する JSON（サーバ固有パラメータ） |
+| `aiAudit.parallel` | `1` | 同時リクエスト数 |
+| `aiAudit.embeddingModel` | `""` | 設計思想検索の埋め込みモデル |
+| `aiAudit.serverType` | `auto` | 推論サーバ種別（auto / llamacpp / vllm / ollama / openai） |
 | `aiAudit.enableOnSave` | `true` | 保存時に自動監査するか |
 | `aiAudit.showInformationDiagnostics` | `false` | low重要度も波線表示するか |
 
@@ -128,9 +145,9 @@ Python / JavaScript / TypeScript ファイルを **Ctrl+S で保存するだけ*
 | Python | ✅ | ✅ | ✅ |
 | JavaScript | ✅ | ✅ | ✅ |
 | TypeScript / TSX | ✅ | ✅ | ✅ |
+| Dart | ✅ | ✅ | ✅ |
 
-> ⚠️ JS/TS 固有の観点（型安全性・非同期処理パターン等）は現バージョンでは未対応です。
-> 出力レポートに注記として自動挿入されます。
+v0.4 から、監査ウェアに JS/TS/Dart 固有の観点（Promise・any・null 安全性など）を追加しました。
 
 ---
 
@@ -171,7 +188,7 @@ VSIXを自分でビルドする場合は、`vscode-extension/` フォルダ内�
 ./build_linux.sh
 ```
 
-各スクリプトは以下を自動実行します:
-1. PyInstaller で実行バイナリをビルド（`bin/<os>/main[.exe]`）
+各スクリプトは以下を自動実行します（バックエンドの手順は `build_backend.py` に共通化）:
+1. リポジトリルートの `ai_audit/` と `main.py` を `python/` にコピーし、PyInstaller で実行バイナリをビルド（`bin/<os>/main[.exe]`）
 2. TypeScript をコンパイル
 3. VSIX をパッケージング（`ai-audit-<os>-<version>.vsix`）

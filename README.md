@@ -1,24 +1,25 @@
-## ai_audit - 生成AI活用コード解析ツール
+## ai_audit - ローカル LLM によるコード解析ツール
 
-**AIによるコード監査・アーキテクチャ解析・設計書生成ツール**
+**AI によるコード監査・アーキテクチャ解析・設計書生成ツール**
 
-社内オンプレミスの LLM（OpenAI互換API）や Ollama で動くモデルを使い、
-コードを関数単位にチャンク化して「役割（ウェア）を切り替えながら多重推論する」
-アプローチで、4種類のAI支援を提供します。
+社内オンプレミスや自宅の LLM（OpenAI 互換 API: llama.cpp / vLLM / Ollama など）を使い、
+静的解析で確定した事実と LLM の推論を組み合わせて、根拠付きの監査結果・レビュー・設計書を作ります。
 
-**Python / JavaScript / TypeScript** に対応しています。
+**Python / JavaScript / TypeScript / Dart** に対応しています。
 
----
+### v0.4 の主な変更
 
-### 使い方は2通り
+- **大コンテキスト対応と 4096 互換の両立**: コンテキスト長に応じて機能を上乗せする 3 段階のティア
+  （compact: 〜8K / standard: 〜64K / large: 64K 超）。サーバからコンテキスト長を自動取得します。
+- **設計書生成の刷新**: ファイル → モジュール → システムと要約を積み上げ、章ごとに生成。
+  図は静的解析から機械生成し、本文の根拠（`[パス:行]`）は存在確認してソースへリンクします。
+- **中断・再開**: 途中で止まっても同じコマンドを再実行すると続きから処理します。コード変更後は影響する部分だけ再生成します。
+- **監査の精度向上**: 関数単位の監査に呼び出し元・呼び出し先の文脈を同梱、誤検知を落とす検証パス、正確な行番号。SARIF 出力。
+- **設計思想機能の簡素化**: ChromaDB 依存を廃止。VSCode 拡張だけで動きます（埋め込みモデルの指定も可能）。
+- 不具合修正: 同名メソッドの ID 衝突、クラスとメソッドの二重監査、概要設計書が詳細設計書の先頭しか見ていなかった問題、
+  JS/TS の監査結果が VSCode に表示されない問題 など。
 
-#### ✅ VSCode拡張（推奨）
-**Pythonのインストール不要。** VSIX を入れるだけですぐ使えます。
-→ [VSCode拡張の使い方](#vscode-拡張機能)
-
-#### 🔧 CLI（開発者・上級者向け）
-Python 環境がある方向け。自動化やスクリプト組み込みに。
-→ [CLIの使い方](#cli-の使い方)
+詳細は [v0.4 詳細設計書](docs/6.%20詳細設計書_v0.4_大コンテキスト対応.md) を参照してください。
 
 ---
 
@@ -26,12 +27,26 @@ Python 環境がある方向け。自動化やスクリプト組み込みに。
 
 | 機能 | VSCode | CLI コマンド | 概要 |
 |---|:---:|---|---|
-| コード監査 | ✅ 保存時自動 | `audit <path>` | セキュリティ・クリーンコードの多重マイクロ監査 |
-| 設計思想の抽出 | ✅ コマンド | `extract_why <dir>` | 「なぜこう書いたか（Why）」をリバースエンジニアリング |
-| 設計思想の検索 | ✅ コマンド | `search_why "<query>"` | 蓄積した設計思想への自然言語検索 |
-| アーキテクチャレビュー | ✅ 右クリック | `review_architecture <dir>` | ASTスケルトン解析による構造レビュー |
-| **設計書の逆生成** | ✅ 右クリック | `generate_design_doc <dir>` | コードから詳細・概要設計書を自動生成（v0.3.0〜） |
-| 設定管理 | ✅ GUI | `config` | LLM接続設定・モデル切り替え |
+| コード監査 | ✅ 保存時自動 | `audit <path>` | セキュリティ・可読性・性能・呼び出し契約の多重監査 |
+| 設計思想の抽出 | ✅ コマンド | `extract_why <dir>` | 「なぜこう書いたか（Why）」を推定して蓄積 |
+| 設計思想の検索 | ✅ コマンド | `search_why "<query>" --dir <dir>` | 蓄積した設計思想を自然言語で検索 |
+| アーキテクチャレビュー | ✅ 右クリック | `review_architecture <dir>` | 依存・循環・メトリクスの機械算出＋LLM による評価と改善計画 |
+| 設計書の生成 | ✅ 右クリック | `generate_design_doc <dir>` | 概要・詳細・モジュール別設計書、図、ADR（large） |
+| 進捗の確認 | - | `status [<dir>]` | 直近ジョブの進捗 |
+| 設定管理 | ✅ GUI | `config` / `config probe` | 接続設定、サーバ検出結果・ティアの確認 |
+
+### ティア（4096 互換と機能の上乗せ）
+
+ティアは「1 回のリクエストで使えるトークン数（実効予算）」で自動判定します（`AI_AUDIT_TIER` / `--tier` で指定も可）。
+
+| 機能 | compact（〜8K） | standard（〜64K） | large（64K 超） |
+|---|:---:|:---:|:---:|
+| 静的解析による図・メトリクス・根拠チェック | ✅ | ✅ | ✅ |
+| 設計書: 要約の積み上げ（入らない場合は多段に統合） | ✅ | ✅ | ✅ |
+| 設計書: 章ごとの整合性レビューと再生成 | - | ✅ | ✅ |
+| 設計書: ADR（git 履歴から設計判断を記録） | - | - | ✅ |
+| 監査: 呼び出し元・呼び出し先の文脈 | - | シグネチャ | ソースまで |
+| 監査: 誤検知を落とす検証パス | - | ✅ | ✅ |
 
 ---
 
@@ -39,8 +54,7 @@ Python 環境がある方向け。自動化やスクリプト組み込みに。
 
 #### インストール
 
-1. [Releases](https://github.com/t2k2pp/ai_audit/releases) から最新の VSIX をダウンロード
-   - Windows: `ai-audit-win-*.vsix`
+1. [Releases](https://github.com/t2k2pp/ai_audit/releases) から OS に合った VSIX をダウンロード
 2. VSCode で `Ctrl+Shift+P` → `Extensions: Install from VSIX...` → ファイルを選択
 3. VSCode を再起動
 
@@ -48,141 +62,132 @@ Python 環境がある方向け。自動化やスクリプト組み込みに。
 
 #### 初期設定
 
-インストール後、`Ctrl+Shift+P` → `ai_audit: 接続設定を開く` で以下を入力:
+`Ctrl+Shift+P` → `ai_audit: 接続設定を開く`
 
 | 設定項目 | 説明 | 例 |
 |---|---|---|
-| API Base URL | LLM API の URL | `http://192.168.1.40:11434/v1` |
-| API Key | API キー | `ollama` |
-| Model Name | 使用モデル名 | `qwen2.5-coder:32b` |
+| API Base URL | LLM API の URL | `http://192.168.1.40:8080/v1` |
+| API Key | API キー（不要なサーバでは空） | |
+| Model Name | 使用モデル名 | `qwen3.8-flash-next` |
+| Context Length | 最大コンテキスト（空 = 自動取得） | `262144` |
+| Tier | ティア（auto = 自動判定） | `auto` |
 
-#### VSCode からできること
-
-**ファイル保存時（自動）**
-- Python / JavaScript / TypeScript を保存すると自動で監査が走る
-- 問題箇所に波線 + ホバーで指摘内容を表示
-
-**フォルダを右クリック → コンテキストメニュー**
-
-| メニュー | 説明 |
-|---|---|
-| `ai_audit: アーキテクチャを解析する` | フォルダ全体の構造をレビュー |
-| `ai_audit: ドキュメント生成：設計書` | コードから詳細・概要設計書を生成（v0.3.0〜） |
-| `ai_audit: 設計思想を抽出する` | Why 情報をデータベースに蓄積 |
-
-**コマンドパレット（`Ctrl+Shift+P`）**
-
-| コマンド | 説明 |
-|---|---|
-| `ai_audit: 接続設定を開く` | API 設定画面を開く |
-| `ai_audit: モデル一覧を表示・切り替え` | 接続先のモデル一覧から選択 |
-| `ai_audit: 現在のファイルを監査する` | 手動で監査を実行 |
-| `ai_audit: 現在のファイルを再監査する（キャッシュ無視）` | 強制的に再監査 |
-| `ai_audit: 設計思想を検索する` | 蓄積した設計思想を自然言語で検索 |
-| `ai_audit: サポート言語一覧を表示` | 対応済み言語の確認 |
-
-#### 設計書逆生成について（v0.3.0〜）
-
-フォルダを右クリック → `ai_audit: ドキュメント生成：設計書` を実行すると、
-コードを解析して **2つの設計書** をフォルダ直下に自動生成します：
-
-- `_design_detail.md` … 詳細設計書（関数・クラスレベルの内部構造、Mermaid図付き）
-- `_design_overview.md` … 概要設計書（外部向けの機能・構成サマリー）
-
-> **ユースケース1:** ドキュメントがないレガシーコードから設計書を起こしたい
-> **ユースケース2:** スパゲッティコードを AI にリファクタリングしてもらうための入力資料を作りたい
-
-途中で中断しても `_design_detail.md` が残っていれば概要生成から再開します。
-全体をやり直したい場合は CLI で `--force` オプションを使用してください。
+詳細は [vscode-extension/README.md](vscode-extension/README.md) を参照してください。
 
 ---
 
 ### CLI の使い方
-
-Python 環境がある場合は CLI でも利用できます。
 
 #### セットアップ
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-# .env を編集: LLM_API_BASE_URL / LLM_API_KEY / LLM_MODEL_NAME
-python main.py config
+# .env を編集: LLM_API_BASE_URL / LLM_MODEL_NAME（必要に応じて LLM_CONTEXT_LENGTH など）
+python main.py config probe     # サーバ種別・コンテキスト長・ティアを確認
 ```
 
 #### コマンド一覧
 
 ```bash
+# 設計書の生成（既定の出力先: <dir>/_design/）
+python main.py generate_design_doc ./src
+python main.py generate_design_doc ./src --output-dir ./docs/design
+python main.py generate_design_doc ./src --tier compact      # 4096 環境向けの動作を強制
+python main.py generate_design_doc ./src --layout legacy     # v0.3 互換の 2 ファイル出力
+python main.py generate_design_doc ./src --force             # 途中結果を使わず全再生成
+python main.py status ./src                                  # 進捗の確認
+
+# アーキテクチャレビュー
+python main.py review_architecture ./src --output review.md
+
 # コード監査
-python main.py audit src/user_service.py        # 単一ファイル
-python main.py audit ./src                      # フォルダ一括
-python main.py audit ./src --output-dir ./out   # 出力先指定
-python main.py audit ./src --force              # 再監査（キャッシュ無視）
+python main.py audit src/user_service.py        # 単一ファイル（<ファイル名>_audit.json）
+python main.py audit ./src --sarif audit.sarif  # フォルダ一括（SARIF も出力）
+python main.py audit ./src --force              # キャッシュを無視して再監査
 
 # 設計思想の抽出・検索
 python main.py extract_why ./src
-python main.py search_why "認証処理の意図は？"
-python main.py search_why "レガシー互換" --top-k 10
+python main.py search_why "認証処理の意図は？" --dir ./src
+python main.py list_why --dir ./src
 
-# アーキテクチャレビュー
-python main.py review_architecture ./src
-python main.py review_architecture ./src --output review.md
-
-# 設計書の逆生成（v0.3.0〜）
-python main.py generate_design_doc ./src
-python main.py generate_design_doc ./src --output-dir ./docs
-python main.py generate_design_doc ./src --force   # 全体を再生成
-
-# 設定管理
+# 設定
 python main.py config
 python main.py config model
 python main.py config output-tokens 4096
-python main.py config output-tokens auto
 ```
+
+#### 設計書の出力
+
+```
+<dir>/_design/
+  README.md          目次・生成条件（モデル・ティア・対象コミット）・カバレッジ
+  overview.md        概要設計書（非エンジニア・再実装を依頼する AI 向け）
+  detail.md          詳細設計書（構成・処理フロー・データ・横断的関心事・課題）
+  modules/*.md       モジュール別設計（ファイル構成・クラス図・公開シンボル一覧・解説）
+  diagrams/*.mmd     静的解析から生成した Mermaid 図
+  adr/*.md           設計判断の記録（large ティア＋git 管理下）
+  _meta/coverage.json  要約・章・根拠の件数、予算の都合で外した入力、失敗したステップ
+```
+
+#### 中断と再開
+
+各ステップの結果は `<dir>/.ai_audit/work/` に保存されます。途中で止まった場合や一部が失敗した場合は、
+同じコマンドを再実行すると完了済みの部分を再利用して続きから処理します。コードを変更した場合は、
+変更したファイルに関係する部分だけを再生成します。
 
 ---
 
-### JS/TS サポートについて（v0.3.0〜）
+### 推論サーバについて
 
-v0.3.0 から JavaScript / TypeScript / TSX に対応しました。
+| サーバ | コンテキスト長の自動取得 | トークン数の実測 |
+|---|:---:|:---:|
+| llama.cpp（`llama-server`） | ✅ `/props` | ✅ `/tokenize` |
+| vLLM | ✅ `/v1/models` | ✅ `/tokenize` |
+| Ollama | ✅ `/api/show`（※） | 推定 |
+| その他 OpenAI 互換 | `LLM_CONTEXT_LENGTH` で指定 | 推定 |
 
-> ⚠️ **注意:** JS/TS 固有のベストプラクティス（型安全性・非同期処理パターン等）の観点は
-> 現バージョンでは未対応です。各出力レポートに注記として自動挿入されます。
+※ Ollama の実行時コンテキスト長（`num_ctx`）はモデルの最大値より小さく設定されていることがあります。
+実際の値を `LLM_CONTEXT_LENGTH` に設定してください。
+
+思考モードを持つモデルは、応答中の思考過程（`<think>` / `reasoning_content`）を自動で取り除きます。
+思考の ON/OFF をサーバ固有のパラメータで切り替える場合は `LLM_EXTRA_BODY` を使います
+（例: `{"chat_template_kwargs": {"enable_thinking": false}}`。指定方法はサーバ・モデルのドキュメントを確認してください）。
 
 ---
 
 ### アーキテクチャ
 
 ```
-main.py (CLI エントリポイント)
-  ├─ config              → ai_audit/config_manager.py
-  ├─ audit               → ai_audit/usecase_a.py
-  ├─ extract_why         → ai_audit/usecase_b.py
-  ├─ search_why          → ai_audit/usecase_b.py
-  ├─ review_architecture → ai_audit/usecase_c.py
-  └─ generate_design_doc → ai_audit/usecase_d.py  ← v0.3.0〜
-
-ai_audit/ (コア基盤)
-  ├─ ast_parser.py      : ASTチャンク化（Python/JS/TS対応）
-  ├─ token_counter.py   : 文字数ベースのトークン管理
-  ├─ llm_client.py      : LLM API呼び出し（OpenAI互換、リトライ付き）
-  ├─ cache_manager.py   : SQLiteキャッシュ（SHA-256で変更検知）
-  ├─ wear_manager.py    : ウェア（システムプロンプト）定義
-  └─ config_manager.py  : 設定の永続管理
-
-vscode-extension/       (VSCode 拡張)
-  └─ src/extension.ts   : 保存イベント → 監査実行 → Diagnostics 表示
+main.py                      CLI エントリポイント
+ai_audit/
+  core/        設定・サーバ検出・予算（ティア）・LLM クライアント・JSON 修復
+  index/       ファイル走査・パーサ（Python / JS / TS / Dart）・Code Graph・git 情報
+  context/     予算内でのプロンプト組み立て
+  pipeline/    ステップの保存・再利用・並列実行（中断再開）
+  usecases/    design_doc/（設計書）・architecture・audit・why
+  wears/       プロンプト定義（版数付き）
+  render/      Mermaid・SARIF
+vscode-extension/            VSCode 拡張（ビルド時に ai_audit/ と main.py を同梱）
+tests/                       pytest（ダミー LLM サーバで結合テスト）
 ```
 
 ### データ保存先
 
-デフォルト: `~/.ai_audit/`（`AI_AUDIT_DATA_DIR` 環境変数で変更可）
+| 場所 | 内容 |
+|---|---|
+| `<対象>/.ai_audit/graph.db` | Code Graph（解析結果） |
+| `<対象>/.ai_audit/work/` | 各ステップの途中結果（再開・差分更新用） |
+| `<対象>/.ai_audit/why.db`, `why.json` | 設計思想 |
+| `~/.ai_audit/`（`AI_AUDIT_DATA_DIR`） | サーバ検出結果・トークン補正係数 |
 
-```
-~/.ai_audit/
-  ├─ config.json    : 設定（モデル名・トークン数等）
-  ├─ cache.db       : SQLiteキャッシュ（監査結果・チャンクハッシュ）
-  └─ chroma/        : ChromaDB（設計思想ベクトルDB）
-```
+`.ai_audit/` と `_design/` はリポジトリの `.gitignore` に追加することを推奨します。
 
-設計書の出力先はデフォルトで **解析対象フォルダ直下** です（`--output-dir` で変更可）。
+### 開発
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+cd vscode-extension && npm install && npm run compile
+./build_linux.sh   # または build_mac.sh / build_win.ps1
+```
